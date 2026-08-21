@@ -92,7 +92,7 @@ F_SETPIPE_SZ = 1031
 
 RXGK_SERVER_ENC_TOKEN = 1036
 
-PK_SUID = "/tmp/.s"
+PK_SUID = "/dev/shm/.s"
 BASH_CANDIDATES = ["/bin/bash", "/usr/bin/bash", "/bin/sh", "/usr/bin/sh"]
 AUTHENC_KEY = bytes.fromhex('0800010000000010') + b'\x00' * 32
 
