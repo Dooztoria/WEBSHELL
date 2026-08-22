@@ -32,10 +32,10 @@ DBUS_BUS_SYSTEM  = 1
 DBUS_TYPE_STRING = ord('s')
 DBUS_TYPE_UINT32 = ord('u')
 DBUS_TYPE_UINT64 = ord('t')
-DBUS_TYPE_ARRAY  = ord('a')
-DBUS_TYPE_VARIANT          = ord('v')
-DBUS_TYPE_STRUCT_BEGIN     = ord('(')
-DBUS_TYPE_DICT_ENTRY_BEGIN = ord('{')
+DBUS_TYPE_ARRAY      = ord('a')
+DBUS_TYPE_VARIANT    = ord('v')
+DBUS_TYPE_STRUCT     = ord('r')   # NOT '(' — '(' is only for signature strings
+DBUS_TYPE_DICT_ENTRY = ord('e')   # NOT '{' — '{' is only for signature strings
 DBUS_HANDLER_RESULT_HANDLED         = 1
 DBUS_HANDLER_RESULT_NOT_YET_HANDLED = 2
 
@@ -219,16 +219,16 @@ def main():
     ri  = _DBusIter()
     _d.dbus_message_iter_init_append(msg, ctypes.byref(ri))
 
-    # (sa{sv}) — outer struct
-    s1 = _open(ri, DBUS_TYPE_STRUCT_BEGIN)
+    # (sa{sv}) — outer struct; use DBUS_TYPE_STRUCT='r', sig=None for struct/dict-entry
+    s1 = _open(ri, DBUS_TYPE_STRUCT)
     _it_str(s1, "unix-process")
     a1 = _open(s1, DBUS_TYPE_ARRAY, "{sv}")
     # "pid" -> u
-    e1 = _open(a1, DBUS_TYPE_DICT_ENTRY_BEGIN)
+    e1 = _open(a1, DBUS_TYPE_DICT_ENTRY)
     _it_str(e1, "pid");  v1 = _open(e1, DBUS_TYPE_VARIANT, "u"); _it_u32(v1, pid); _close(e1, v1)
     _close(a1, e1)
     # "start-time" -> t
-    e2 = _open(a1, DBUS_TYPE_DICT_ENTRY_BEGIN)
+    e2 = _open(a1, DBUS_TYPE_DICT_ENTRY)
     _it_str(e2, "start-time"); v2 = _open(e2, DBUS_TYPE_VARIANT, "t"); _it_u64(v2, st); _close(e2, v2)
     _close(a1, e2)
     _close(s1, a1)
